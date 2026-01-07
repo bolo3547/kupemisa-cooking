@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Icon Converter</title>
+  <style>
+    body { font-family: sans-serif; padding: 20px; background: #1a1a1a; color: white; }
+    .icon { margin: 10px; display: inline-block; }
+    canvas { display: block; margin: 5px 0; }
+    a { color: #f97316; }
+  </style>
+</head>
+<body>
+  <h1>Fleet Oil Monitor - PWA Icons</h1>
+  <p>Right-click each image and save as PNG:</p>
+  <div id="icons"></div>
+  <script>
+    const sizes = [72, 96, 128, 144, 152, 192, 384, 512];
+    const container = document.getElementById('icons');
+    
+    sizes.forEach(size => {
+      const div = document.createElement('div');
+      div.className = 'icon';
+      div.innerHTML = `<h3>${size}x${size}</h3>`;
+      
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      
+      // Draw background
+      ctx.fillStyle = '#1a1a1a';
+      ctx.beginPath();
+      ctx.roundRect(0, 0, size, size, size * 0.2);
+      ctx.fill();
+      
+      // Draw oil droplet
+      const scale = size / 100;
+      const offsetX = size * 0.15;
+      const offsetY = size * 0.1;
+      
+      ctx.save();
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, scale);
+      
+      // Gradient
+      const gradient = ctx.createLinearGradient(10, 10, 60, 90);
+      gradient.addColorStop(0, '#f97316');
+      gradient.addColorStop(1, '#ea580c');
+      
+      // Droplet shape
+      ctx.beginPath();
+      ctx.moveTo(35, 10);
+      ctx.bezierCurveTo(35, 10, 10, 45, 10, 60);
+      ctx.bezierCurveTo(10, 78, 22, 90, 35, 90);
+      ctx.bezierCurveTo(48, 90, 60, 78, 60, 60);
+      ctx.bezierCurveTo(60, 45, 35, 10, 35, 10);
+      ctx.fillStyle = gradient;
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      
+      // Highlight
+      ctx.beginPath();
+      ctx.ellipse(25, 55, 8, 12, -20 * Math.PI / 180, 0, 2 * Math.PI);
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.fill();
+      
+      ctx.restore();
+      
+      div.appendChild(canvas);
+      
+      // Download link
+      const link = document.createElement('a');
+      link.href = canvas.toDataURL('image/png');
+      link.download = `icon-${size}x${size}.png`;
+      link.textContent = 'Download PNG';
+      div.appendChild(link);
+      
+      container.appendChild(div);
+    });
+  </script>
+</body>
+</html>

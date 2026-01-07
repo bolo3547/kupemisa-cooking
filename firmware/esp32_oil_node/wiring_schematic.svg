@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="800" viewBox="0 0 1200 800">
+  <style>
+    .title { font: bold 20px sans-serif; }
+    .label { font: 14px sans-serif; }
+    .pin { font: 12px monospace; }
+    .note { font: 12px sans-serif; fill: #333; }
+    .box { fill: #f7f9fb; stroke: #333; stroke-width: 2px; }
+    .wire { stroke-width: 3px; stroke-linecap: round; }
+    .gnd { stroke: #000; }
+    .vcc { stroke: #e84c3d; }
+    .spi { stroke: #3498db; }
+    .signal { stroke: #2ecc71; }
+    .control { stroke: #9b59b6; }
+    .conflict { fill: #fff3cd; stroke: #f39c12; }
+  </style>
+
+  <text x="20" y="30" class="title">ESP32 Oil Node — Wiring Schematic</text>
+  <text x="20" y="50" class="note">File: <tspan font-family="monospace">firmware/esp32_oil_node/wiring_schematic.svg</tspan> • Created for ILI9488 TFT, keypad, flow sensor, pump (relay), ultrasonic</text>
+
+  <!-- Page border -->
+  <rect x="8" y="8" width="1184" height="784" fill="none" stroke="#444" stroke-width="2"/>
+
+  <!-- A4 print note -->
+  <g>
+    <rect x="900" y="560" width="230" height="60" rx="6" fill="#fff8e6" stroke="#f1c40f"/>
+    <text x="915" y="585" class="label">Print-ready</text>
+    <text x="915" y="605" class="note">Scale to A4 (300 DPI preferred) · margins 15mm</text>
+  </g>
+
+  <!-- ESP32 block -->
+  <rect x="60" y="80" width="240" height="460" class="box" rx="10"/>
+  <text x="180" y="110" text-anchor="middle" class="label">ESP32-WROOM-32</text>
+
+  <!-- Left pins list -->
+  <text x="40" y="150" class="pin">GPIO 32 ─ ROW0</text>
+  <text x="40" y="180" class="pin">GPIO 33 ─ ROW1</text>
+  <text x="40" y="210" class="pin">GPIO 25 ─ ROW2</text>
+  <text x="40" y="240" class="pin">GPIO 13 ─ ROW3</text>
+  <text x="40" y="290" class="pin">GPIO 12 ─ COL0</text>
+  <text x="40" y="320" class="pin">GPIO 14 ─ COL1</text>
+  <text x="40" y="350" class="pin">GPIO 16 ─ COL2</text>
+  <text x="40" y="380" class="pin">GPIO 17 ─ COL3</text>
+  <text x="40" y="430" class="pin">3.3V  ─ VCC (TFT)</text>
+  <text x="40" y="460" class="pin">GND   ─ GND (all)</text>
+
+  <!-- Right pins list -->
+  <text x="310" y="150" class="pin" text-anchor="end">GPIO 23 ─ TFT MOSI</text>
+  <text x="310" y="180" class="pin" text-anchor="end">GPIO 18 ─ TFT SCK / Ultrasonic TRIG *</text>
+  <text x="310" y="210" class="pin" text-anchor="end">GPIO 19 ─ TFT MISO / Ultrasonic ECHO *</text>
+  <text x="310" y="240" class="pin" text-anchor="end">GPIO 5  ─ TFT CS</text>
+  <text x="310" y="270" class="pin" text-anchor="end">GPIO 2  ─ TFT DC</text>
+  <text x="310" y="300" class="pin" text-anchor="end">GPIO 4  ─ TFT RST</text>
+  <text x="310" y="330" class="pin" text-anchor="end">GPIO 15 ─ TFT LED (opt)</text>
+  <text x="310" y="360" class="pin" text-anchor="end">GPIO 27 ─ FLOW Signal</text>
+  <text x="310" y="390" class="pin" text-anchor="end">GPIO 26 ─ PUMP Relay IN</text>
+  <text x="310" y="420" class="pin" text-anchor="end">GPIO 22 ─ Ultrasonic TRIG (alt)</text>
+  <text x="310" y="450" class="pin" text-anchor="end">GPIO 21 ─ Ultrasonic ECHO (alt)</text>
+
+  <!-- TFT block -->
+  <rect x="420" y="80" width="320" height="220" class="box" rx="8"/>
+  <text x="580" y="110" text-anchor="middle" class="label">ILI9488 3.5" TFT (SPI)</text>
+  <text x="500" y="150" class="pin">VCC → 3.3V</text>
+  <text x="500" y="175" class="pin">GND → GND</text>
+  <text x="500" y="200" class="pin">CS  → GPIO 5</text>
+  <text x="500" y="225" class="pin">RST → GPIO 4</text>
+  <text x="500" y="250" class="pin">DC  → GPIO 2</text>
+  <text x="500" y="275" class="pin">MOSI→ GPIO 23</text>
+  <text x="500" y="300" class="pin">SCK → GPIO 18</text>
+  <text x="500" y="325" class="pin">MISO→ GPIO 19 (opt)</text>
+  <text x="500" y="350" class="pin">LED → GPIO 15 or 3.3V</text>
+
+  <!-- Keypad -->
+  <rect x="420" y="320" width="240" height="160" class="box" rx="6"/>
+  <text x="540" y="350" text-anchor="middle" class="label">4x4 Keypad</text>
+  <text x="475" y="380" class="pin">R1 → GPIO 32</text>
+  <text x="475" y="400" class="pin">R2 → GPIO 33</text>
+  <text x="475" y="420" class="pin">R3 → GPIO 25</text>
+  <text x="475" y="440" class="pin">R4 → GPIO 13</text>
+  <text x="605" y="380" class="pin">C1 → GPIO 12</text>
+  <text x="605" y="400" class="pin">C2 → GPIO 14</text>
+  <text x="605" y="420" class="pin">C3 → GPIO 16</text>
+  <text x="605" y="440" class="pin">C4 → GPIO 17</text>
+
+  <!-- Flow Sensor -->
+  <rect x="780" y="80" width="260" height="120" class="box" rx="6"/>
+  <text x="910" y="110" text-anchor="middle" class="label">AICHI OF05ZAT Flow Sensor</text>
+  <text x="860" y="140" class="pin">VCC → 5V</text>
+  <text x="860" y="160" class="pin">GND → GND</text>
+  <text x="860" y="180" class="pin">SIG → GPIO 27 (interrupt)</text>
+
+  <!-- Pump / Relay -->
+  <rect x="780" y="220" width="260" height="120" class="box" rx="6"/>
+  <text x="910" y="250" text-anchor="middle" class="label">STARFLO 12V Pump (via relay)</text>
+  <text x="860" y="280" class="pin">Relay IN → GPIO 26</text>
+  <text x="860" y="300" class="pin">Relay VCC → 5V</text>
+  <text x="860" y="320" class="pin">Relay GND → GND</text>
+  <text x="860" y="340" class="note">Pump power: 12V (separate supply). Add fuse &amp; flyback diode/MOSFET protection.</text>
+
+  <!-- Ultrasonic -->
+  <rect x="780" y="360" width="260" height="120" class="box" rx="6"/>
+  <text x="910" y="390" text-anchor="middle" class="label">Ultrasonic Sensor (HC-SR04)</text>
+  <text x="860" y="420" class="pin">VCC → 5V</text>
+  <text x="860" y="440" class="pin">GND → GND</text>
+  <text x="860" y="460" class="pin">TRIG → GPIO 18 (or GPIO 22)</text>
+  <text x="860" y="480" class="pin">ECHO → GPIO 19 (or GPIO 21)</text>
+
+  <!-- Wires (representative) -->
+  <!-- TFT MOSI -->
+  <line x1="300" y1="275" x2="500" y2="275" class="wire spi" stroke="#3498db" />
+  <!-- TFT SCK -->
+  <line x1="300" y1="245" x2="500" y2="300" class="wire spi" stroke="#3498db" />
+  <!-- TFT CS -->
+  <line x1="300" y1="305" x2="500" y2="200" class="wire spi" stroke="#3498db" />
+  <!-- TFT DC -->
+  <line x1="300" y1="275" x2="500" y2="225" class="wire spi" stroke="#3498db" />
+  <!-- TFT RST -->
+  <line x1="300" y1="295" x2="500" y2="175" class="wire control" stroke="#9b59b6" />
+  <!-- TFT LED -->
+  <line x1="300" y1="335" x2="500" y2="350" class="wire vcc" stroke="#e84c3d" />
+  <!-- Flow signal -->
+  <line x1="300" y1="365" x2="860" y2="180" class="wire signal" stroke="#2ecc71" />
+  <!-- Pump control -->
+  <line x1="300" y1="395" x2="860" y2="280" class="wire control" stroke="#9b59b6" />
+  <!-- Ultrasonic TRIG/ECHO (with conflict note) -->
+  <line x1="300" y1="185" x2="860" y2="460" class="wire signal" stroke="#2ecc71" />
+  <rect x="330" y="160" width="420" height="80" class="conflict" rx="6"/>
+  <text x="540" y="200" text-anchor="middle" class="note">Note: GPIO 18/19 used by TFT SCK/MISO — see options: change ultrasonic or remap TFT SPI</text>
+
+  <!-- Power & GND rails -->
+  <line x1="200" y1="430" x2="860" y2="430" stroke="#000" stroke-width="3" />
+  <text x="90" y="430" class="pin">GND (common)</text>
+  <line x1="200" y1="430" x2="200" y2="250" stroke="#e84c3d" stroke-width="3" />
+  <text x="210" y="250" class="pin">3.3V (TFT VCC)</text>
+  <line x1="800" y1="140" x2="980" y2="140" stroke="#e84c3d" stroke-width="3" />
+  <text x="980" y="140" class="pin">5V (Flow / Ultrasonic / Relay VCC)</text>
+
+  <!-- Legend -->
+  <rect x="20" y="560" width="1160" height="200" fill="#ffffff" stroke="#ddd" />
+  <text x="40" y="590" class="label">Legend</text>
+  <text x="40" y="615" class="note">• Use a common ground for ESP32, sensors, TFT, and relay/pump supply.</text>
+  <text x="40" y="635" class="note">• TFT: 3.3V only. Flow / Ultrasonic often require 5V — check sensor spec.</text>
+  <text x="40" y="655" class="note">• Pump: 12V power supply (separate). Use a relay or MOSFET with flyback diode and fuse.</text>
+  <text x="40" y="675" class="note">• Default pins shown; update firmware #defines or TFT_eSPI User_Setup.h to remap pins if needed.</text>
+  <text x="40" y="695" class="note">• *Optional: Move ultrasonic to GPIO 22/21 to avoid SPI conflicts.</text>
+
+</svg>

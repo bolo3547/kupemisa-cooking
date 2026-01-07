@@ -1,0 +1,29 @@
+name: Headless Firmware Build (Arduino CLI)
+
+on:
+  push: {}
+  pull_request: {}
+
+jobs:
+  build-headless:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+        with:
+          version: latest
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Compile firmware in headless mode
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32 \
+            --build-property compiler.cpp.extra_flags=-DDISABLE_DISPLAY \
+            --build-property compiler.c.extra_flags=-DDISABLE_DISPLAY \
+            firmware/esp32_oil_node

@@ -1,0 +1,37 @@
+name: Display-enabled Firmware Build (Arduino CLI)
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-display:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Arduino CLI
+        uses: arduino/setup-arduino-cli@v1
+        with:
+          version: latest
+
+      - name: Install ESP32 core
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+
+      - name: Install required libraries
+        run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "TFT_eSPI"
+          arduino-cli lib install "Keypad"
+          arduino-cli lib install "TJpg_Decoder"
+          arduino-cli lib install "PNGdec"
+          arduino-cli lib install "XPT2046_Touchscreen"
+          arduino-cli lib install "ArduinoJson"
+
+      - name: Compile firmware (display enabled)
+        run: |
+          arduino-cli compile --fqbn esp32:esp32:esp32 firmware/esp32_oil_node

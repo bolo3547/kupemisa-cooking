@@ -1,0 +1,303 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  OWNER
+  VIEWER
+}
+
+enum OperatorRole {
+  OPERATOR
+  SUPERVISOR
+}
+
+enum DeviceStatus {
+  OK
+  LOW
+  CRITICAL
+  OFFLINE
+}
+
+enum DispenseStatus {
+  STARTED
+  DONE
+  ERROR
+  CANCELED
+}
+
+enum CommandType {
+  PUMP_ON
+  PUMP_OFF
+  DISPENSE_TARGET
+  SET_PRICE_PER_LITER
+}
+
+enum CommandStatus {
+  PENDING
+  SENT
+  ACKED
+  FAILED
+  EXPIRED
+}
+
+enum EventSeverity {
+  INFO
+  WARN
+  CRITICAL
+}
+
+model User {
+  id             String          @id @default(cuid())
+  email          String          @unique
+  passwordHash   String
+  role           UserRole        @default(VIEWER)
+  createdAt      DateTime        @default(now())
+  commands       Command[]       @relation("CommandCreator")
+  priceSchedules PriceSchedule[] @relation("PriceCreator")
+  operators      Operator[]      @relation("OperatorOwner")
+  devices        Device[]        @relation("DeviceOwner")
+
+  @@index([email])
+}
+
+model Operator {
+  id                   String               @id @default(cuid())
+  ownerId              String               // Links operator to an owner/user
+  name                 String
+  pinHash              String               // Bcrypt hash for dashboard verification
+  pinHashDevice        String               // SHA256 hash for device-side verification
+  role                 OperatorRole         @default(OPERATOR)
+  isActive             Boolean              @default(true)
+  createdAt            DateTime             @default(now())
+  updatedAt            DateTime             @updatedAt
+  
+  owner                User                 @relation("OperatorOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  dispenseTransactions DispenseTransaction[]
+
+  @@unique([ownerId, pinHashDevice])  // Unique PIN per owner
+  @@index([ownerId, isActive])
+  @@index([isActive])
+  @@index([name])
+}
+
+model PriceSchedule {
+  id                   String    @id @default(cuid())
+  deviceId             String?   // null = global price, else device-specific
+  currency             String    @default("ZMW")
+  sellingPricePerLiter Float
+  costPricePerLiter    Float     @default(0)
+  effectiveFrom        DateTime
+  effectiveTo          DateTime?
+  createdByUserId      String
+  createdAt            DateTime  @default(now())
+  
+  device               Device?   @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  createdBy            User      @relation("PriceCreator", fields: [createdByUserId], references: [id])
+
+  @@index([deviceId, effectiveFrom])
+  @@index([effectiveFrom])
+}
+
+model DispenseTransaction {
+  id              String         @id @default(cuid())
+  deviceId        String
+  operatorId      String?
+  sessionId       String         @unique
+  startedAt       DateTime
+  endedAt         DateTime?
+  status          DispenseStatus @default(STARTED)
+  targetLiters    Float
+  dispensedLiters Float          @default(0)
+  pricePerLiter   Float
+  costPerLiter    Float          @default(0)
+  totalCost       Float          @default(0)
+  totalProfit     Float          @default(0)
+  currency        String         @default("ZMW")
+  durationSec     Int            @default(0)
+  errorMessage    String?        @db.Text
+  
+  device          Device         @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  operator        Operator?      @relation(fields: [operatorId], references: [id])
+
+  @@index([deviceId, startedAt])
+  @@index([operatorId, startedAt])
+  @@index([status, startedAt])
+  @@index([sessionId])
+}
+
+model ShiftSummary {
+  id                String   @id @default(cuid())
+  deviceId          String
+  operatorId        String?
+  shiftDate         DateTime // Date at 00:00
+  totalTransactions Int      @default(0)
+  totalLiters       Float    @default(0)
+  totalSales        Float    @default(0)
+  totalProfit       Float    @default(0)
+  currency          String   @default("ZMW")
+  updatedAt         DateTime @updatedAt
+  
+  device            Device   @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+
+  @@unique([deviceId, operatorId, shiftDate])
+  @@index([shiftDate])
+  @@index([deviceId, shiftDate])
+}
+
+model Device {
+  id                   String                @id @default(cuid())
+  deviceId             String                @unique // OIL-0001, OIL-0002, etc.
+  siteName             String
+  location             String?
+  notes                String?               @db.Text
+  apiKeyHash           String
+  ownerId              String
+  status               DeviceStatus          @default(OFFLINE)
+  lastSeenAt           DateTime?
+  createdAt            DateTime              @default(now())
+  
+  telemetry            Telemetry[]
+  events               Event[]
+  alertRules           AlertRule[]
+  commands             Command[]
+  commandAcks          CommandAck[]
+  priceSchedules       PriceSchedule[]
+  dispenseTransactions DispenseTransaction[]
+  shiftSummaries       ShiftSummary[]
+  owner                User                  @relation("DeviceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([deviceId])
+  @@index([ownerId])
+  @@index([status])
+  @@index([lastSeenAt])
+}
+
+model Telemetry {
+  id           String   @id @default(cuid())
+  deviceId     String
+  ts           BigInt   // Unix timestamp in milliseconds
+  oilPercent   Float    // 0-100
+  oilLiters    Float    // Current oil level in liters
+  distanceCm   Float    // Ultrasonic sensor distance
+  flowLpm      Float    // Flow rate liters per minute
+  litersTotal  Float    // Total liters dispensed
+  pumpState    Boolean  // true = ON, false = OFF
+  safetyStatus String   // OK, DRY_RUN_SHUTDOWN, LOW_LEVEL_BLOCK, etc.
+  wifiRssi     Int      // WiFi signal strength
+  uptimeSec    Int      // Device uptime in seconds
+  
+  device       Device   @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+
+  @@index([deviceId, ts])
+  @@index([ts])
+}
+
+model Event {
+  id       String        @id @default(cuid())
+  deviceId String
+  ts       BigInt        // Unix timestamp in milliseconds
+  type     String        // PUMP_ON, PUMP_OFF, THRESHOLD_CROSSED, SAFETY_TRIGGERED, etc.
+  severity EventSeverity
+  message  String        @db.Text
+  metaJson Json?
+  
+  device   Device        @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+
+  @@index([deviceId, ts])
+  @@index([ts])
+  @@index([severity])
+}
+
+model AlertRule {
+  id                String   @id @default(cuid())
+  deviceId          String?  // null = global rule
+  lowThreshold      Float    @default(15) // percentage
+  criticalThreshold Float    @default(5)  // percentage
+  notifyEmail       String?
+  notifySms         String?
+  enabled           Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  
+  device            Device?  @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+
+  @@index([deviceId])
+  @@index([enabled])
+}
+
+model Command {
+  id              String        @id @default(cuid())
+  deviceId        String
+  type            CommandType
+  payloadJson     Json?         // e.g., {"liters": 50} for DISPENSE_TARGET
+  status          CommandStatus @default(PENDING)
+  createdAt       DateTime      @default(now())
+  sentAt          DateTime?
+  ackedAt         DateTime?
+  expiresAt       DateTime
+  createdByUserId String
+  
+  device          Device        @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  createdBy       User          @relation("CommandCreator", fields: [createdByUserId], references: [id])
+  acks            CommandAck[]
+
+  @@index([deviceId, createdAt])
+  @@index([status, expiresAt])
+}
+
+model CommandAck {
+  id         String    @id @default(cuid())
+  commandId  String
+  deviceId   String
+  receivedAt DateTime  @default(now())
+  executedAt DateTime?
+  ok         Boolean
+  message    String?   @db.Text
+  metaJson   Json?
+  
+  command    Command   @relation(fields: [commandId], references: [id], onDelete: Cascade)
+  device     Device    @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+
+  @@index([commandId])
+  @@index([deviceId])
+}
+
+enum ActivityAction {
+  LOGIN
+  LOGOUT
+  CREATE_DEVICE
+  UPDATE_DEVICE
+  DELETE_DEVICE
+  CREATE_COMMAND
+  CREATE_OPERATOR
+  UPDATE_OPERATOR
+  DELETE_OPERATOR
+  UPDATE_PRICING
+  EXPORT_REPORT
+  UPDATE_ALERT_RULE
+}
+
+model ActivityLog {
+  id          String         @id @default(cuid())
+  userId      String
+  userName    String
+  userEmail   String
+  action      ActivityAction
+  resourceType String?       // "Device", "Command", "Operator", etc.
+  resourceId   String?
+  description  String        @db.Text
+  metaJson     Json?         // Additional context
+  ipAddress    String?
+  userAgent    String?       @db.Text
+  createdAt    DateTime      @default(now())
+
+  @@index([userId, createdAt])
+  @@index([createdAt])
+  @@index([action])
+  @@index([resourceType, resourceId])
+}
