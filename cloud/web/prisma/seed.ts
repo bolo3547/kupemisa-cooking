@@ -7,13 +7,13 @@ async function main() {
   console.log('Starting database seed...');
 
   // Create OWNER user
-  const passwordHash = await bcrypt.hash('Admin123!', 12);
+  const passwordHash = await bcrypt.hash('kupemisa', 12);
 
   const owner = await prisma.user.upsert({
-    where: { email: 'admin@denuel.local' },
-    update: {},
+    where: { email: 'kupemisa@gmail.com' },
+    update: { passwordHash },
     create: {
-      email: 'admin@denuel.local',
+      email: 'kupemisa@gmail.com',
       passwordHash,
       role: UserRole.OWNER,
     },
@@ -57,7 +57,7 @@ async function main() {
   console.log('Seed completed successfully!');
   console.log('');
   console.log('Login credentials:');
-  console.log('  OWNER: admin@denuel.local / Admin123!');
+  console.log('  OWNER: kupemisa@gmail.com / kupemisa');
   console.log('  VIEWER: viewer@denuel.local / Viewer123!');
 }
 
