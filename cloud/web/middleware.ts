@@ -5,6 +5,19 @@ import { getToken } from 'next-auth/jwt';
 export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
+  // Allow public files and API routes that don't need auth
+  if (
+    pathname.startsWith('/api/auth') ||
+    pathname.startsWith('/api/health') ||
+    pathname.startsWith('/_next') ||
+    pathname.startsWith('/icons') ||
+    pathname === '/manifest.json' ||
+    pathname === '/sw.js' ||
+    pathname === '/favicon.ico'
+  ) {
+    return NextResponse.next();
+  }
+
   // Protect dashboard routes
   if (pathname.startsWith('/dashboard')) {
     const token = await getToken({
