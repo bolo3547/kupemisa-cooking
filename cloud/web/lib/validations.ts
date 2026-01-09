@@ -36,6 +36,11 @@ export const commandSchema = z.object({
     .object({
       liters: z.number().positive().optional(),
       price: z.number().min(0).max(10000).optional(),
+      // Extended fields for DISPENSE_TARGET - auto-populated by backend
+      operatorId: z.string().optional(),
+      operatorName: z.string().optional(),
+      pricePerLiter: z.number().min(0).optional(),
+      currency: z.string().optional(),
     })
     .optional(),
 });

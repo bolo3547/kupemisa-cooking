@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
 import { commandSchema } from '@/lib/validations';
-import { UserRole, CommandStatus } from '@prisma/client';
+import { UserRole, CommandStatus, CommandType } from '@prisma/client';
+import { getApplicablePrice } from '@/lib/price-utils';
 
 export async function POST(
   request: NextRequest,
@@ -30,6 +31,18 @@ export async function POST(
 
     const { type, payloadJson } = validation.data;
 
+    // For DISPENSE_TARGET, enrich payload with current price info
+    let enrichedPayload = payloadJson || {};
+    if (type === 'DISPENSE_TARGET') {
+      const priceInfo = await getApplicablePrice(deviceId, new Date());
+      enrichedPayload = {
+        ...enrichedPayload,
+        pricePerLiter: priceInfo.pricePerLiter,
+        costPerLiter: priceInfo.costPerLiter,
+        currency: priceInfo.currency,
+      };
+    }
+
     // Create command with 5 min expiry
     const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
@@ -37,7 +50,7 @@ export async function POST(
       data: {
         deviceId,
         type,
-        payloadJson: payloadJson || undefined,
+        payloadJson: Object.keys(enrichedPayload).length > 0 ? enrichedPayload : undefined,
         status: CommandStatus.PENDING,
         expiresAt,
         createdByUserId: session.user.id,
