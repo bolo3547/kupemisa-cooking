@@ -3,6 +3,9 @@ import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
 import { parseDispenseEventMeta, DISPENSE_EVENT_TYPES } from '@/lib/dispense-utils';
 
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 /**
  * GET /api/transactions
  * 

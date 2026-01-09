@@ -3,6 +3,9 @@ import prisma from '@/lib/prisma';
 import { requireAuth } from '@/lib/auth';
 import { transactionsQuerySchema } from '@/lib/validations';
 
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 /**
  * GET /api/dispense-transactions
  * List dispense transactions with pagination and filters

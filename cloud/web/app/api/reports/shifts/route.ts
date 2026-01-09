@@ -3,6 +3,9 @@ import prisma from '@/lib/prisma';
 import { requireAuth } from '@/lib/auth';
 import { shiftsQuerySchema } from '@/lib/validations';
 
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 /**
  * GET /api/reports/shifts
  * Get daily shift totals

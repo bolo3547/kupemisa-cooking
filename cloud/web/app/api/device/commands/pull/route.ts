@@ -4,6 +4,9 @@ import { verifyDeviceAuth } from '@/lib/device-auth';
 import { checkRateLimit } from '@/lib/rate-limit';
 import { CommandStatus } from '@prisma/client';
 
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 export async function GET(request: NextRequest) {
   try {
     const deviceId = request.headers.get('x-device-id');

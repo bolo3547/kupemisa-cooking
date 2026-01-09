@@ -51,6 +51,25 @@ export async function GET(request: NextRequest) {
     // Get current pricing
     const price = await getCurrentPrice(authResult.device.deviceId);
 
+    // Check for active LCD display message
+    const displayMessage = await prisma.deviceDisplayMessage.findUnique({
+      where: { deviceId: authResult.device.deviceId },
+    });
+
+    let display = undefined;
+    if (displayMessage && displayMessage.expiresAt > new Date()) {
+      const ttlSec = Math.floor(
+        (displayMessage.expiresAt.getTime() - Date.now()) / 1000
+      );
+      if (ttlSec > 0) {
+        display = {
+          line0: displayMessage.line0.substring(0, 16),
+          line1: displayMessage.line1.substring(0, 16),
+          ttlSec,
+        };
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       deviceId: authResult.device.deviceId,
@@ -60,6 +79,7 @@ export async function GET(request: NextRequest) {
         costPerLiter: price.costPerLiter,
         currency: price.currency,
       },
+      ...(display && { display }),
       timestamp: Date.now(),
     });
   } catch (error) {

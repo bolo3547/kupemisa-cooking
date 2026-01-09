@@ -302,3 +302,16 @@ model ActivityLog {
   @@index([action])
   @@index([resourceType, resourceId])
 }
+
+model DeviceDisplayMessage {
+  id        String   @id @default(cuid())
+  deviceId  String   @unique
+  line0     String   // Max 16 chars, truncated server-side
+  line1     String   // Max 16 chars, truncated server-side
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([deviceId, expiresAt])
+  @@index([expiresAt])
+}
