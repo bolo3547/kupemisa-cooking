@@ -2,8 +2,27 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { receiptIngestSchema } from '@/lib/validations';
 import { getApplicablePrice, calculateTransactionFinancials } from '@/lib/price-utils';
-import { verifyDeviceAuth } from '@/lib/device-auth';
 import bcrypt from 'bcryptjs';
+
+export const runtime = "nodejs";
+
+/**
+ * Simplified device authentication helper
+ */
+async function requireDevice(req: NextRequest) {
+  const deviceId = req.headers.get("x-device-id") || "";
+  const apiKey = req.headers.get("x-api-key") || "";
+  if (!deviceId || !apiKey) return null;
+
+  const dev = await prisma.device.findUnique({ where: { deviceId } });
+  if (!dev) return null;
+  
+  // Use bcrypt to securely compare API key
+  const isValid = await bcrypt.compare(apiKey, dev.apiKeyHash);
+  if (!isValid) return null;
+  
+  return dev;
+}
 
 /**
  * POST /api/ingest/receipt
@@ -14,18 +33,16 @@ import bcrypt from 'bcryptjs';
 export async function POST(request: NextRequest) {
   try {
     // Verify device authentication
-    const deviceId = request.headers.get('x-device-id');
-    const apiKey = request.headers.get('x-api-key');
-    const authResult = await verifyDeviceAuth(deviceId, apiKey);
-    if (!authResult.valid || !authResult.device) {
+    const dev = await requireDevice(request);
+    if (!dev) {
       return NextResponse.json(
-        { ok: false, error: 'Invalid device credentials' },
+        { ok: false, error: 'UNAUTHORIZED' },
         { status: 401 }
       );
     }
 
-    const authedDeviceId = authResult.device.deviceId;
-    const ownerId = authResult.device.ownerId ?? null;
+    const authedDeviceId = dev.deviceId;
+    const ownerId = dev.ownerId ?? null;
 
     // Update device lastSeenAt
     await prisma.device.update({

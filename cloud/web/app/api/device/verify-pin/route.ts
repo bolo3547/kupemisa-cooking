@@ -1,8 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
-import { verifyDeviceAuth } from "@/lib/device-auth";
 import { checkRateLimit } from "@/lib/rate-limit";
 import bcrypt from "bcryptjs";
+
+export const runtime = "nodejs";
+
+async function requireDevice(req: NextRequest) {
+  const deviceId = req.headers.get("x-device-id") || "";
+  const apiKey = req.headers.get("x-api-key") || "";
+  if (!deviceId || !apiKey) return null;
+
+  const dev = await prisma.device.findUnique({ where: { deviceId } });
+  if (!dev) return null;
+  
+  const isValid = await bcrypt.compare(apiKey, dev.apiKeyHash);
+  if (!isValid) return null;
+  
+  return dev;
+}
 
 /**
  * POST /api/device/verify-pin
@@ -10,25 +25,17 @@ import bcrypt from "bcryptjs";
  * Used when device doesn't have operator cached or wants real-time verification
  */
 export async function POST(request: NextRequest) {
-  // Verify device authentication
-  const deviceId = request.headers.get("x-device-id");
-  const apiKey = request.headers.get("x-api-key");
-
-  if (!deviceId || !apiKey) {
-    return NextResponse.json(
-      { error: "Missing device credentials" },
-      { status: 401 }
-    );
-  }
-
   try {
-    const authResult = await verifyDeviceAuth(deviceId, apiKey);
-    if (!authResult.valid || !authResult.device) {
+    // Verify device authentication
+    const dev = await requireDevice(request);
+    if (!dev) {
       return NextResponse.json(
-        { error: "Unauthorized" },
+        { ok: false, error: "UNAUTHORIZED" },
         { status: 401 }
       );
     }
+
+    const authResult = { device: dev, valid: true };
 
     if (!authResult.device.ownerId) {
       return NextResponse.json(

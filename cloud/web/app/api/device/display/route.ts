@@ -1,7 +1,23 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
-import { verifyDeviceAuth } from "@/lib/device-auth";
 import { z } from "zod";
+import bcrypt from "bcryptjs";
+
+export const runtime = "nodejs";
+
+async function requireDevice(req: NextRequest) {
+  const deviceId = req.headers.get("x-device-id") || "";
+  const apiKey = req.headers.get("x-api-key") || "";
+  if (!deviceId || !apiKey) return null;
+
+  const dev = await prisma.device.findUnique({ where: { deviceId } });
+  if (!dev) return null;
+  
+  const isValid = await bcrypt.compare(apiKey, dev.apiKeyHash);
+  if (!isValid) return null;
+  
+  return dev;
+}
 
 /**
  * POST /api/device/display
@@ -16,24 +32,16 @@ const displaySchema = z.object({
 });
 
 export async function POST(request: NextRequest) {
-  const deviceId = request.headers.get("x-device-id");
-  const apiKey = request.headers.get("x-api-key");
-
-  if (!deviceId || !apiKey) {
-    return NextResponse.json(
-      { ok: false, error: "Missing device credentials" },
-      { status: 401 }
-    );
-  }
-
   try {
-    const authResult = await verifyDeviceAuth(deviceId, apiKey);
-    if (!authResult.valid || !authResult.device) {
+    const dev = await requireDevice(request);
+    if (!dev) {
       return NextResponse.json(
-        { ok: false, error: "Unauthorized" },
+        { ok: false, error: "UNAUTHORIZED" },
         { status: 401 }
       );
     }
+
+    const authResult = { device: dev, valid: true };
 
     const body = await request.json();
     
@@ -96,27 +104,17 @@ export async function POST(request: NextRequest) {
  * Clear LCD display message
  */
 export async function DELETE(request: NextRequest) {
-  const deviceId = request.headers.get("x-device-id");
-  const apiKey = request.headers.get("x-api-key");
-
-  if (!deviceId || !apiKey) {
-    return NextResponse.json(
-      { ok: false, error: "Missing device credentials" },
-      { status: 401 }
-    );
-  }
-
   try {
-    const authResult = await verifyDeviceAuth(deviceId, apiKey);
-    if (!authResult.valid || !authResult.device) {
+    const dev = await requireDevice(request);
+    if (!dev) {
       return NextResponse.json(
-        { ok: false, error: "Unauthorized" },
+        { ok: false, error: "UNAUTHORIZED" },
         { status: 401 }
       );
     }
 
     await prisma.deviceDisplayMessage.deleteMany({
-      where: { deviceId: authResult.device.deviceId },
+      where: { deviceId: dev.deviceId },
     });
 
     return NextResponse.json({

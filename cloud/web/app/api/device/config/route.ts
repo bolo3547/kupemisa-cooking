@@ -1,8 +1,24 @@
 import { NextRequest, NextResponse } from "next/server";
 import prisma from "@/lib/prisma";
-import { verifyDeviceAuth } from "@/lib/device-auth";
 import { checkRateLimit } from "@/lib/rate-limit";
 import { getCurrentPrice } from "@/lib/price-utils";
+import bcrypt from "bcryptjs";
+
+export const runtime = "nodejs";
+
+async function requireDevice(req: NextRequest) {
+  const deviceId = req.headers.get("x-device-id") || "";
+  const apiKey = req.headers.get("x-api-key") || "";
+  if (!deviceId || !apiKey) return null;
+
+  const dev = await prisma.device.findUnique({ where: { deviceId } });
+  if (!dev) return null;
+  
+  const isValid = await bcrypt.compare(apiKey, dev.apiKeyHash);
+  if (!isValid) return null;
+  
+  return dev;
+}
 
 /**
  * GET /api/device/config
@@ -10,25 +26,17 @@ import { getCurrentPrice } from "@/lib/price-utils";
  * Device calls this after operator login to get current price per liter
  */
 export async function GET(request: NextRequest) {
-  // Verify device authentication
-  const deviceId = request.headers.get("x-device-id");
-  const apiKey = request.headers.get("x-api-key");
-
-  if (!deviceId || !apiKey) {
-    return NextResponse.json(
-      { error: "Missing device credentials" },
-      { status: 401 }
-    );
-  }
-
   try {
-    const authResult = await verifyDeviceAuth(deviceId, apiKey);
-    if (!authResult.valid || !authResult.device) {
+    // Verify device authentication
+    const dev = await requireDevice(request);
+    if (!dev) {
       return NextResponse.json(
-        { error: "Unauthorized" },
+        { ok: false, error: "UNAUTHORIZED" },
         { status: 401 }
       );
     }
+
+    const authResult = { device: dev, valid: true };
 
     const rateLimitResult = checkRateLimit(
       `${authResult.device.deviceId}-config`,
