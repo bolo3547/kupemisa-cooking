@@ -40,6 +40,7 @@ export const commandSchema = z.object({
       operatorId: z.string().optional(),
       operatorName: z.string().optional(),
       pricePerLiter: z.number().min(0).optional(),
+      costPerLiter: z.number().min(0).optional(),
       currency: z.string().optional(),
     })
     .optional(),
