@@ -1,7 +1,7 @@
 /********************************************************************
  * ESP32 Oil Dispenser - Dashboard Integrated Version
  * 
- * This firmware works with the EXISTING Vercel dashboard.
+ * This firmware works with the LIVE Vercel dashboard.
  * DO NOT change backend APIs. Device obeys dashboard commands only.
  * 
  * Hardware:
@@ -11,16 +11,23 @@
  *  - Relay-controlled pump
  *  - Flow sensor (pulse output)
  * 
- * Device identity: DEVICE_ID + API_KEY only
+ * Device identity: DEVICE_ID + API_KEY headers
  * Dashboard handles: ownership, sites, users, operators, pricing
  * 
  * State Machine:
  *  WAIT_AUTH    - Locked, ignore keypad, poll for commands
  *  AUTH_READY   - Dashboard authorized, D=start, keypad active
- *  DISPENSING   - Pump running, *=stop
+ *  DISPENSING   - Pump running, *=pause
  *  PAUSED       - Pump paused, #=resume, *=cancel
  *  COMPLETE     - Send receipt, auto-return to WAIT_AUTH
  *  ERROR_STATE  - Error occurred, #=reset
+ * 
+ * API Routes Used:
+ *  GET  /api/device/commands/pull - Poll for pending commands
+ *  POST /api/device/commands/ack  - Acknowledge command execution
+ *  POST /api/ingest/telemetry     - Send telemetry data
+ *  POST /api/ingest/receipt       - Send dispense receipt
+ *  GET  /api/device/config        - Get device config & pricing
  ********************************************************************/
 
 #include <WiFi.h>
@@ -46,26 +53,16 @@
   LiquidCrystal_I2C lcd(0x27, 16, 2);  // Address 0x27 or 0x3F
 #endif
 
-// ========================= USER CONFIG (PASTE HERE) =========================
-// Paste ONLY these defines when provisioning a new device:
-// #define DEVICE_ID "OIL-0001"
-// #define API_KEY "your-api-key-here"
-// #define API_BASE_URL "https://web-tau-wine.vercel.app"
-// #define SITE_NAME "Site Name"
-// ==========================================================================
+// ═══════════════════════════════════════════════════════════════════════════
+// ✅ DEVICE CONFIGURATION - EDIT THESE VALUES FOR YOUR DEVICE
+// ═══════════════════════════════════════════════════════════════════════════
 
-#ifndef DEVICE_ID
-  #define DEVICE_ID "OIL-UNCONFIGURED"
-#endif
-#ifndef API_KEY
-  #define API_KEY "UNCONFIGURED"
-#endif
-#ifndef API_BASE_URL
-  #define API_BASE_URL "https://web-tau-wine.vercel.app"
-#endif
-#ifndef SITE_NAME
-  #define SITE_NAME "UNNAMED"
-#endif
+#define DEVICE_ID     "OIL-004"
+#define API_KEY       "Oavby6r-nZKGpfWwekEDu6vytqZ3oQuROQk5EgxEkzE"
+#define API_BASE_URL  "https://web-tau-wine.vercel.app"
+#define SITE_NAME     "Simply Asian"
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 // ========================= WIFI CONFIG =========================
 const char* WIFI_SSID = "";   // e.g. "MTN_4G"
@@ -143,8 +140,11 @@ uint32_t lastPollMs = 0;
 uint32_t lastTelemetryMs = 0;
 
 static const uint32_t UI_REFRESH_MS = 250;
-static const uint32_t POLL_INTERVAL_MS = 3000;     // Poll dashboard every 3s
+static const uint32_t POLL_INTERVAL_MS = 2500;     // Poll dashboard every 2.5s
 static const uint32_t TELEMETRY_INTERVAL_MS = 10000; // Send telemetry every 10s
+static const uint32_t CONFIG_FETCH_INTERVAL_MS = 60000; // Fetch config every 60s
+
+uint32_t lastConfigFetchMs = 0;
 
 // ========================= HTTPS CLIENT =========================
 WiFiClientSecure secureClient;
@@ -386,25 +386,37 @@ void uiError() {
 /**
  * Send HTTPS POST request to dashboard
  * Uses WiFiClientSecure with certificate validation disabled (setInsecure)
- * for compatibility with various hosting providers
+ * for compatibility with Vercel and other hosting providers
  */
 int httpPost(const char* path, const String& body, String& response) {
-  if (WiFi.status() != WL_CONNECTED) return -1;
-  if (!isConfigured()) return -2;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] WiFi not connected");
+    return -1;
+  }
+  if (!isConfigured()) {
+    Serial.println("[HTTP] Device not configured");
+    return -2;
+  }
   
   HTTPClient http;
   String url = baseUrl() + String(path);
+  
+  Serial.printf("[HTTP] POST %s\n", url.c_str());
+  Serial.printf("[HTTP] Body: %s\n", body.substring(0, min((int)body.length(), 200)).c_str());
   
   http.begin(secureClient, url);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-id", String(DEVICE_ID));
   http.addHeader("x-api-key", String(API_KEY));
-  http.setTimeout(10000);
+  http.setTimeout(10000);  // 10 second timeout
   
   int code = http.POST((uint8_t*)body.c_str(), body.length());
   
   if (code > 0) {
     response = http.getString();
+    Serial.printf("[HTTP] Response %d: %s\n", code, response.substring(0, min((int)response.length(), 150)).c_str());
+  } else {
+    Serial.printf("[HTTP] Error: %d (%s)\n", code, http.errorToString(code).c_str());
   }
   
   http.end();
@@ -415,25 +427,72 @@ int httpPost(const char* path, const String& body, String& response) {
  * Send HTTPS GET request to dashboard
  */
 int httpGet(const char* path, String& response) {
-  if (WiFi.status() != WL_CONNECTED) return -1;
-  if (!isConfigured()) return -2;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] WiFi not connected");
+    return -1;
+  }
+  if (!isConfigured()) {
+    Serial.println("[HTTP] Device not configured");
+    return -2;
+  }
   
   HTTPClient http;
   String url = baseUrl() + String(path);
   
+  Serial.printf("[HTTP] GET %s\n", url.c_str());
+  
   http.begin(secureClient, url);
   http.addHeader("x-device-id", String(DEVICE_ID));
   http.addHeader("x-api-key", String(API_KEY));
-  http.setTimeout(10000);
+  http.setTimeout(10000);  // 10 second timeout
   
   int code = http.GET();
   
   if (code > 0) {
     response = http.getString();
+    Serial.printf("[HTTP] Response %d: %s\n", code, response.substring(0, min((int)response.length(), 150)).c_str());
+  } else {
+    Serial.printf("[HTTP] Error: %d (%s)\n", code, http.errorToString(code).c_str());
   }
   
   http.end();
   return code;
+}
+
+/**
+ * Fetch device config and pricing from dashboard
+ * Dashboard API: GET /api/device/config
+ */
+void fetchDeviceConfig() {
+  String response;
+  int code = httpGet("/api/device/config", response);
+  
+  if (code != 200) {
+    Serial.printf("[CONFIG] Failed to fetch config: HTTP %d\n", code);
+    return;
+  }
+  
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    Serial.printf("[CONFIG] JSON parse error: %s\n", err.c_str());
+    return;
+  }
+  
+  if (doc["ok"].as<bool>()) {
+    // Update pricing from dashboard
+    if (doc["price"]["pricePerLiter"].is<float>()) {
+      dashPrice.pricePerLiter = doc["price"]["pricePerLiter"].as<float>();
+    }
+    if (doc["price"]["costPerLiter"].is<float>()) {
+      dashPrice.costPerLiter = doc["price"]["costPerLiter"].as<float>();
+    }
+    if (doc["price"]["currency"].is<const char*>()) {
+      strncpy(dashPrice.currency, doc["price"]["currency"].as<const char*>(), sizeof(dashPrice.currency) - 1);
+    }
+    Serial.printf("[CONFIG] Price: %s %.2f/L (cost: %.2f)\n", 
+      dashPrice.currency, dashPrice.pricePerLiter, dashPrice.costPerLiter);
+  }
 }
 
 // ========================= DASHBOARD COMMUNICATION =========================
@@ -443,7 +502,7 @@ int httpGet(const char* path, String& response) {
  * Dashboard API: GET /api/device/commands/pull
  * 
  * Expected command types:
- *  - DISPENSE_TARGET: { "liters": 10.0 } - Authorizes dispensing
+ *  - DISPENSE_TARGET: { "liters": 10.0, "operatorId": "...", "operatorName": "...", "pricePerLiter": 25.0 }
  *  - PUMP_ON: Direct pump control (emergency)
  *  - PUMP_OFF: Direct pump control (emergency)
  *  - SET_PRICE_PER_LITER: { "price": 25.0 } - Update local price
@@ -452,8 +511,15 @@ void pollDashboardCommands() {
   // Only poll in WAIT_AUTH state
   if (state != WAIT_AUTH) return;
   
+  Serial.println("[POLL] Checking for commands...");
+  
   String response;
   int code = httpGet("/api/device/commands/pull", response);
+  
+  if (code == 429) {
+    Serial.println("[POLL] Rate limited - waiting...");
+    return;
+  }
   
   if (code != 200) {
     Serial.printf("[POLL] HTTP error: %d\n", code);
@@ -469,13 +535,14 @@ void pollDashboardCommands() {
   }
   
   if (!doc["ok"].as<bool>()) {
-    Serial.println("[POLL] Dashboard returned ok:false");
+    Serial.printf("[POLL] Dashboard returned ok:false - error: %s\n", 
+      doc["error"].as<const char*>() ? doc["error"].as<const char*>() : "unknown");
     return;
   }
   
   // Check if command exists
   if (doc["command"].isNull()) {
-    // No pending command - this is normal
+    // No pending command - this is normal, don't log every time
     return;
   }
   
@@ -743,29 +810,37 @@ void resetTransaction() {
 
 void setup() {
   Serial.begin(115200);
+  delay(100);  // Allow serial to initialize
+  
   Serial.println("\n========================================");
   Serial.println("ESP32 Oil Dispenser - Dashboard Edition");
-  Serial.printf("Device: %s\n", DEVICE_ID);
-  Serial.printf("API: %s\n", API_BASE_URL);
+  Serial.println("========================================");
+  Serial.printf("Device ID:  %s\n", DEVICE_ID);
+  Serial.printf("Site Name:  %s\n", SITE_NAME);
+  Serial.printf("API URL:    %s\n", API_BASE_URL);
   Serial.println("========================================\n");
   
   // Initialize pump (OFF)
   pinMode(PIN_PUMP, OUTPUT);
   pumpSet(false);
+  Serial.println("[INIT] Pump initialized (OFF)");
   
   // Initialize flow sensor interrupt
   pinMode(PIN_FLOW, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_FLOW), onFlowPulse, RISING);
+  Serial.println("[INIT] Flow sensor initialized");
   
   // Initialize display
   #ifdef USE_TFT_DISPLAY
     tft.init();
     tft.setRotation(1);
     tft.fillScreen(TFT_BLACK);
+    Serial.println("[INIT] TFT display initialized");
   #endif
   #ifdef USE_LCD_I2C
     lcd.init();
     lcd.backlight();
+    Serial.println("[INIT] LCD display initialized");
   #endif
   
   // Load saved settings
@@ -774,19 +849,38 @@ void setup() {
   // Connect to WiFi
   connectWiFi();
   
-  // Setup HTTPS client - skip certificate validation for compatibility
-  // This is acceptable for IoT devices where the alternative is no encryption
+  // Setup HTTPS client - skip certificate validation for Vercel compatibility
+  // This is required for ESP32 to connect to Vercel's rotating certificates
   secureClient.setInsecure();
+  Serial.println("[INIT] HTTPS client configured (insecure mode for Vercel)");
+  
+  // Fetch initial device config (pricing) from dashboard
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("[INIT] Fetching device config from dashboard...");
+    fetchDeviceConfig();
+    lastConfigFetchMs = millis();
+  }
   
   // Start in WAIT_AUTH state
   state = WAIT_AUTH;
   
-  Serial.println("[READY] Waiting for dashboard authorization...");
+  Serial.println("\n[READY] Waiting for dashboard authorization...");
+  Serial.println("[READY] Keypad is LOCKED until dashboard sends DISPENSE_TARGET command");
 }
 
 // ========================= MAIN LOOP =========================
 
 void loop() {
+  // Reconnect WiFi if disconnected
+  if (WiFi.status() != WL_CONNECTED) {
+    static uint32_t lastWifiRetry = 0;
+    if (millis() - lastWifiRetry > 30000) {  // Retry every 30s
+      Serial.println("[WIFI] Reconnecting...");
+      connectWiFi();
+      lastWifiRetry = millis();
+    }
+  }
+  
   // Update flow sensor readings
   updateFlow();
   
@@ -794,6 +888,12 @@ void loop() {
   if (millis() - lastTelemetryMs > TELEMETRY_INTERVAL_MS) {
     lastTelemetryMs = millis();
     sendTelemetry();
+  }
+  
+  // Periodic config refresh (get latest pricing)
+  if (millis() - lastConfigFetchMs > CONFIG_FETCH_INTERVAL_MS) {
+    lastConfigFetchMs = millis();
+    fetchDeviceConfig();
   }
   
   // Poll dashboard for commands (only in WAIT_AUTH state)
