@@ -52,7 +52,7 @@ export default function LoginPage() {
         <CardHeader className="text-center">
           <Link href="/" className="inline-flex items-center justify-center gap-2 mb-4">
             <Droplet className="h-8 w-8 text-primary" />
-            <span className="text-xl font-semibold">Fleet Oil Monitor</span>
+            <span className="text-xl font-semibold">Pimisha</span>
           </Link>
           <CardTitle className="text-2xl">Welcome back</CardTitle>
           <CardDescription>
@@ -107,7 +107,7 @@ export default function LoginPage() {
           
           <div className="mt-6 text-center text-sm text-muted-foreground">
             <p>Login credentials:</p>
-            <p className="font-mono text-xs mt-1">kupemisa@gmail.com / kupemisa</p>
+            <p className="font-mono text-xs mt-1">pimisha@gmail.com / pimisha</p>
           </div>
         </CardContent>
       </Card>

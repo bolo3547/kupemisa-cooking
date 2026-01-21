@@ -42,7 +42,7 @@ export function MobileNav({ isOwner, userEmail, userRole }: MobileNavProps) {
               <div className="flex items-center justify-between mb-8">
                 <Link href="/dashboard" className="flex items-center gap-2" onClick={closeMenu}>
                   <Droplet className="h-6 w-6 text-primary" />
-                  <span className="font-semibold">Fleet Oil</span>
+                  <span className="font-semibold">Pimisha</span>
                 </Link>
                 <Button variant="ghost" size="icon" onClick={closeMenu}>
                   <X className="h-5 w-5" />

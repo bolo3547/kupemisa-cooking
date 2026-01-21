@@ -39,13 +39,18 @@ import { ReceiptModal } from '@/components/receipt-modal';
 
 interface Transaction {
   id: string;
+  sessionId?: string;
   deviceId: string;
   siteName: string;
   location?: string;
+  operatorId?: string | null;
+  operatorName?: string;
   ts: number;
   time: string;
-  type: string;
+  endTime?: string;
+  type?: string;
   result: string;
+  status?: string;
   targetLiters?: number;
   dispensedLiters?: number;
   durationSec?: number;
@@ -53,7 +58,9 @@ interface Transaction {
   error?: string;
   message: string;
   pricePerLiter?: number;
+  costPerLiter?: number;
   totalCost?: number;
+  totalProfit?: number;
   currency?: string;
 }
 
@@ -342,7 +349,7 @@ export default function TransactionsPage() {
                   <TableHeader>
                     <TableRow className="bg-secondary/30">
                       <TableHead className="text-xs font-medium">Time</TableHead>
-                      <TableHead className="text-xs font-medium">Device</TableHead>
+                      <TableHead className="text-xs font-medium">Operator</TableHead>
                       <TableHead className="text-xs font-medium">Site</TableHead>
                       <TableHead className="text-xs font-medium">Result</TableHead>
                       <TableHead className="text-xs font-medium text-right">Target (L)</TableHead>
@@ -359,13 +366,8 @@ export default function TransactionsPage() {
                         <TableCell className="text-xs">
                           <div>{formatTime(tx.ts)}</div>
                         </TableCell>
-                        <TableCell>
-                          <Link 
-                            href={`/dashboard/devices/${tx.deviceId}`}
-                            className="text-xs font-mono text-blue-600 hover:underline"
-                          >
-                            {tx.deviceId}
-                          </Link>
+                        <TableCell className="text-sm font-medium">
+                          {tx.operatorName || 'Unknown'}
                         </TableCell>
                         <TableCell className="text-sm">
                           {tx.siteName}
@@ -420,6 +422,7 @@ export default function TransactionsPage() {
                                 id: tx.id,
                                 siteName: tx.siteName,
                                 deviceId: tx.deviceId,
+                                operatorName: tx.operatorName,
                                 targetLiters: tx.targetLiters,
                                 dispensedLiters: tx.dispensedLiters,
                                 pricePerLiter: tx.pricePerLiter,

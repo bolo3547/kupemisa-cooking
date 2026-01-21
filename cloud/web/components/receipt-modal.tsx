@@ -19,6 +19,8 @@ interface ReceiptModalProps {
     id: string;
     siteName: string;
     deviceId: string;
+    operatorId?: string;
+    operatorName?: string;
     targetLiters?: number;
     dispensedLiters?: number;
     pricePerLiter?: number;
@@ -41,6 +43,7 @@ export function ReceiptModal({ transaction, trigger }: ReceiptModalProps) {
   const receiptText = generateReceiptText({
     siteName: transaction.siteName,
     deviceId: transaction.deviceId,
+    operatorName: transaction.operatorName,
     targetLiters: transaction.targetLiters,
     dispensedLiters: transaction.dispensedLiters,
     pricePerLiter: transaction.pricePerLiter,
@@ -109,6 +112,12 @@ export function ReceiptModal({ transaction, trigger }: ReceiptModalProps) {
               <span className="text-neutral-500">Device:</span>
               <span>{transaction.deviceId}</span>
             </div>
+            {transaction.operatorName && (
+              <div className="flex justify-between">
+                <span className="text-neutral-500">Operator:</span>
+                <span className="font-medium text-blue-700">{transaction.operatorName}</span>
+              </div>
+            )}
             <div className="flex justify-between">
               <span className="text-neutral-500">Date:</span>
               <span>{timestamp.toLocaleDateString()}</span>

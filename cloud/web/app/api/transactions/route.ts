@@ -1,7 +1,6 @@
 import { NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
-import { parseDispenseEventMeta, DISPENSE_EVENT_TYPES } from '@/lib/dispense-utils';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
@@ -9,7 +8,7 @@ export const revalidate = 0;
 /**
  * GET /api/transactions
  * 
- * Query dispense transactions (events) with filters
+ * Query dispense transactions with filters
  * 
  * Query params:
  * - range: '24h' | '7d' | '30d' | 'all' (default: '7d')
@@ -53,32 +52,27 @@ export async function GET(request: Request) {
         fromDate = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
     }
 
-    // Build event type filter - include DISPENSE_RECEIPT for pricing data
-    let typeFilter: string[] = [];
-    if (status === 'DONE') {
-      typeFilter = ['DISPENSE_DONE', 'DISPENSE_RECEIPT'];
-    } else if (status === 'ERROR') {
-      typeFilter = ['DISPENSE_ERROR'];
-    } else {
-      typeFilter = ['DISPENSE_DONE', 'DISPENSE_ERROR', 'DISPENSE_RECEIPT'];
-    }
-
-    // Build where clause
-    const where: any = {
-      type: { in: typeFilter },
-    };
+    // Build where clause for DispenseTransaction table
+    const where: any = {};
 
     if (fromDate) {
-      where.ts = { gte: BigInt(fromDate.getTime()) };
+      where.startedAt = { gte: fromDate };
     }
 
     if (deviceId) {
       where.deviceId = deviceId;
     }
 
-    // Query events with device info
-    const [events, total] = await Promise.all([
-      prisma.event.findMany({
+    if (status === 'DONE') {
+      where.status = 'DONE';
+    } else if (status === 'ERROR') {
+      where.status = { in: ['ERROR', 'CANCELED'] };
+    }
+    // 'all' - no status filter
+
+    // Query DispenseTransaction with device and operator info
+    const [transactions, total] = await Promise.all([
+      prisma.dispenseTransaction.findMany({
         where,
         include: {
           device: {
@@ -88,48 +82,64 @@ export async function GET(request: Request) {
               location: true,
             },
           },
+          operator: {
+            select: {
+              id: true,
+              name: true,
+            },
+          },
         },
-        orderBy: { ts: 'desc' },
+        orderBy: { startedAt: 'desc' },
         take: limit,
         skip: offset,
       }),
-      prisma.event.count({ where }),
+      prisma.dispenseTransaction.count({ where }),
     ]);
 
-    // Transform events to transactions with pricing
-    const transactions = events.map((event) => {
-      const meta = parseDispenseEventMeta(event.metaJson);
-      
+    // Transform transactions for frontend
+    const result = transactions.map((tx) => {
       return {
-        id: event.id,
-        deviceId: event.device.deviceId,
-        siteName: event.device.siteName,
-        location: event.device.location,
-        ts: Number(event.ts),
-        time: new Date(Number(event.ts)).toISOString(),
-        type: event.type,
-        result: event.type === 'DISPENSE_ERROR' ? 'ERROR' : 'SUCCESS',
-        targetLiters: meta.targetLiters,
-        dispensedLiters: meta.dispensedLiters,
-        durationSec: meta.durationSec,
-        transactionId: meta.transactionId,
-        error: meta.error,
-        message: event.message,
-        // Pricing fields
-        pricePerLiter: meta.pricePerLiter,
-        totalCost: meta.totalCost,
-        currency: meta.currency || 'ZMW',
+        id: tx.id,
+        sessionId: tx.sessionId,
+        deviceId: tx.device.deviceId,
+        siteName: tx.device.siteName,
+        location: tx.device.location,
+        // Operator info
+        operatorId: tx.operator?.id || null,
+        operatorName: tx.operator?.name || 'Unknown',
+        // Time - use startedAt timestamp
+        ts: tx.startedAt.getTime(),
+        time: tx.startedAt.toISOString(),
+        endTime: tx.endedAt?.toISOString(),
+        // Status
+        result: tx.status === 'DONE' ? 'SUCCESS' : 'ERROR',
+        status: tx.status,
+        // Dispense data
+        targetLiters: tx.targetLiters,
+        dispensedLiters: tx.dispensedLiters,
+        durationSec: tx.durationSec,
+        // Pricing
+        pricePerLiter: tx.pricePerLiter,
+        costPerLiter: tx.costPerLiter,
+        totalCost: tx.totalCost,
+        totalProfit: tx.totalProfit,
+        currency: tx.currency || 'ZMW',
+        // Error
+        error: tx.errorMessage,
+        message: tx.status === 'DONE' 
+          ? `Dispensed ${tx.dispensedLiters.toFixed(2)}L` 
+          : tx.errorMessage || 'Transaction failed',
       };
     });
 
     return NextResponse.json({
       ok: true,
-      transactions,
+      transactions: result,
       pagination: {
         total,
         limit,
         offset,
-        hasMore: offset + transactions.length < total,
+        hasMore: offset + result.length < total,
       },
     });
   } catch (error) {

@@ -21,7 +21,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
         <div className="container mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
           <Link href="/dashboard" className="flex items-center gap-2 group">
             <Droplet className="h-7 w-7 text-primary transition-transform group-hover:scale-110 group-hover:rotate-12" />
-            <span className="text-base sm:text-lg font-semibold bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text">Fleet Oil Monitor</span>
+            <span className="text-base sm:text-lg font-semibold bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text">Pimisha</span>
           </Link>
           <nav className="hidden md:flex items-center gap-6">
             <Link href="/dashboard" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">

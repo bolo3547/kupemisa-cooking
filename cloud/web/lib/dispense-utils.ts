@@ -207,6 +207,7 @@ export function generateReceiptText(
   transaction: {
     siteName: string;
     deviceId: string;
+    operatorName?: string;
     targetLiters?: number;
     dispensedLiters?: number;
     pricePerLiter?: number;
@@ -228,6 +229,7 @@ export function generateReceiptText(
     '',
     `Site:     ${transaction.siteName}`,
     `Device:   ${transaction.deviceId}`,
+    transaction.operatorName ? `Operator: ${transaction.operatorName}` : '',
     `Date:     ${date.toLocaleDateString()}`,
     `Time:     ${date.toLocaleTimeString()}`,
     '',

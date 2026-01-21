@@ -7,27 +7,27 @@ import { Providers } from './providers';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Fleet Oil Monitor',
-  description: 'Real-time monitoring and control for oil tank fleet',
+  title: 'Pimisha Oil System',
+  description: 'Real-time monitoring and control for oil dispensing',
   manifest: '/manifest.json',
   appleWebApp: {
     capable: true,
     statusBarStyle: 'default',
-    title: 'Fleet Oil Monitor',
+    title: 'Pimisha',
   },
   formatDetection: {
     telephone: false,
   },
   openGraph: {
     type: 'website',
-    siteName: 'Fleet Oil Monitor',
-    title: 'Fleet Oil Monitor',
-    description: 'Real-time oil tank monitoring system',
+    siteName: 'Pimisha',
+    title: 'Pimisha Oil System',
+    description: 'Real-time oil dispensing system',
   },
   twitter: {
     card: 'summary',
-    title: 'Fleet Oil Monitor',
-    description: 'Real-time oil tank monitoring system',
+    title: 'Pimisha Oil System',
+    description: 'Real-time oil dispensing system',
   },
 };
 

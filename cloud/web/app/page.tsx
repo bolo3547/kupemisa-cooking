@@ -10,7 +10,7 @@ export default function HomePage() {
         <div className="container mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <Droplet className="h-8 w-8 text-primary" />
-            <span className="text-xl font-semibold">Fleet Oil Monitor</span>
+            <span className="text-xl font-semibold">Pimisha</span>
           </div>
           <Link href="/login">
             <Button variant="outline">Sign In</Button>
@@ -89,7 +89,7 @@ export default function HomePage() {
       {/* Footer */}
       <footer className="border-t border-border/50 mt-20">
         <div className="container mx-auto px-6 py-8 text-center text-muted-foreground">
-          <p>© 2024 Fleet Oil Monitoring System. Built by Denuel Inambao.</p>
+          <p>© 2026 Pimisha Oil System. Built by Denuel Inambao.</p>
         </div>
       </footer>
     </div>

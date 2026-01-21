@@ -1,7 +1,7 @@
 {
-  "name": "Fleet Oil Monitor",
-  "short_name": "FleetOil",
-  "description": "Real-time oil tank monitoring system for fleet management",
+  "name": "Pimisha Oil System",
+  "short_name": "Pimisha",
+  "description": "Real-time oil dispensing and monitoring system",
   "start_url": "/dashboard",
   "display": "standalone",
   "background_color": "#0a0a0a",
