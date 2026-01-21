@@ -38,6 +38,9 @@ export default async function DashboardLayout({ children }: { children: React.Re
             </Link>
             {isOwner && (
               <>
+                <Link href="/dashboard/performance" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
+                Performance
+                </Link>
                 <Link href="/dashboard/operators" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
                   Operators
                 </Link>
@@ -72,3 +75,4 @@ export default async function DashboardLayout({ children }: { children: React.Re
     </div>
   );
 }
+

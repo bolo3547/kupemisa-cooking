@@ -94,6 +94,13 @@ export function MobileNav({ isOwner, userEmail, userRole }: MobileNavProps) {
                     >
                       Operators
                     </Link>
+                      <Link
+                        href="/dashboard/performance"
+                        className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
+                        onClick={closeMenu}
+                      >
+                        Performance
+                      </Link>
                     <Link 
                       href="/dashboard/pricing" 
                       className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
@@ -134,3 +141,4 @@ export function MobileNav({ isOwner, userEmail, userRole }: MobileNavProps) {
     </>
   );
 }
+
