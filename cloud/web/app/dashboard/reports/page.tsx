@@ -206,6 +206,56 @@ export default function ReportsPage() {
 
         {/* Shift Totals Tab */}
         <TabsContent value="shifts" className="space-y-4">
+          {/* Today Totals (fleet-wide, respects current filters) */}
+          {shiftData && (() => {
+            const today = new Date().toISOString().split('T')[0];
+            const todayShift = shiftData.shifts.find((s) => s.date === today);
+            const currency = shiftData.totals.currency;
+            return (
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <div>
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      Todays Totals
+                      <Badge variant="outline">Today</Badge>
+                    </CardTitle>
+                    <CardDescription>
+                      Based on completed transactions for {todayShift ? today : 'today'}
+                    </CardDescription>
+                  </div>
+                </CardHeader>
+                <CardContent>
+                  <div className="grid gap-4 md:grid-cols-4">
+                    <div>
+                      <div className="text-xs text-muted-foreground">Transactions</div>
+                      <div className="text-xl font-semibold">
+                        {todayShift ? todayShift.totalTransactions : 0}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">Liters</div>
+                      <div className="text-xl font-semibold">
+                        {todayShift ? todayShift.totalLiters.toFixed(2) : '0.00'} L
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">Sales</div>
+                      <div className="text-xl font-semibold">
+                        {formatCurrency(todayShift ? todayShift.totalSales : 0, currency)}
+                      </div>
+                    </div>
+                    <div>
+                      <div className="text-xs text-muted-foreground">Profit</div>
+                      <div className="text-xl font-semibold">
+                        {formatCurrency(todayShift ? todayShift.totalProfit : 0, currency)}
+                      </div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            );
+          })()}
+
           {/* Filters */}
           <Card>
             <CardHeader>

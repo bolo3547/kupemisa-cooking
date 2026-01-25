@@ -1,1905 +1,1196 @@
-/********************************************************************
- * ESP32 Oil Dispenser (Filling Station Mode) with Operator Login
- * 
- * PRODUCTION-CRITICAL FIRMWARE - PATCHED VERSION
- * 
- * Hardware:
- *  - ESP32 Dev Module (ESP-WROOM-32) or D1 R32
- *  - 16x2 I2C LCD (PCF8574 backpack, address 0x27 or 0x3F)
- *  - 4x4 Matrix Keypad
- *  - Flow sensor (pulse output)
- *  - Pump (12V) via relay/MOSFET
- * 
- * Features:
- *  - ONLINE + OFFLINE SUPPORT
- *  - Local operator login via keypad (PIN-based)
- *  - Dashboard verifies operator credentials (when online)
- *  - Local PIN cache for offline operation (SHA256 hashed)
- *  - Local liters entry after login
- *  - Auto-stop at target liters (flow sensor is source of truth)
- *  - Sale recording sent to dashboard (queued if offline)
- *  - Auto-logout after each sale
- *  - Maximum pump runtime failsafe
- * 
- * Flow:
- *  1. IDLE: Show "WAIT AUTH / Press A Login"
- *  2. Press A -> Enter PIN mode
- *  3. Enter PIN, press # to confirm
- *  4. Dashboard verifies PIN (or local cache if offline)
- *  5. If valid -> Enter liters mode
- *  6. Enter liters, press # to confirm
- *  7. Show "READY / Press D to dispense"
- *  8. D starts pump, * stops pump (emergency)
- *  9. Pump auto-stops at target liters
- * 10. Sale sent to dashboard (or queued), auto-logout, return to IDLE
+﻿/********************************************************************
+ * ESP32 OIL DISPENSER - FINAL PRODUCTION FIRMWARE (ESP32 CORE 3.x)
  ********************************************************************/
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
-#include <ArduinoJson.h>
 #include <Keypad.h>
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
-#include <time.h>
-#include <mbedtls/sha256.h>
-#include <esp_task_wdt.h>
-#include <esp_system.h>
-#include <rom/rtc.h>
+#include <ArduinoJson.h>
+#include "mbedtls/sha256.h"
 
-// ========================= USER CONFIG (PASTE HERE) =========================
-#define DEVICE_ID "OIL-0001"
-#define API_KEY "QV-nQArRlomVfBOiL1Ob1P4mtIz88a7mO0c3kXVZYK8"
-#define API_BASE_URL "https://fleet-oil-system.vercel.app"
-#define SITE_NAME "PHI"
+/* ================= DEVICE / DASHBOARD ================= */
+#define DEVICE_ID     "OIL-0007"
+#define SITE_NAME     "GreenBean Cafe"
+#define API_BASE_URL  "https://fleet-oil-system.vercel.app"
+#define API_KEY       "REDACTED"
 
-// ========================= OFFLINE FALLBACK CONFIG =========================
-// These operators can login when WiFi is unavailable
-// PINs stored as SHA256 hashes for security
-// To generate hash: echo -n "1234" | sha256sum
-// WARNING: Update these hashes if changing default PINs
-#define OFFLINE_HASH_1 "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4"  // PIN: 1234
-#define OFFLINE_NAME_1 "Operator 1"
-#define OFFLINE_ROLE_1 "operator"
-
-#define OFFLINE_HASH_2 "ef797c8118f02dfb649607dd5d3f8c7623048c9c063d532cc95c5ed7a898a64f"  // PIN: 5678
-#define OFFLINE_NAME_2 "Operator 2"
-#define OFFLINE_ROLE_2 "operator"
-
-#define OFFLINE_HASH_3 "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"  // PIN: 0000 (admin if SUPERVISOR role)
-#define OFFLINE_NAME_3 "Admin"
-#define OFFLINE_ROLE_3 "SUPERVISOR"
-
-// Default price if never connected to dashboard (fallback)
-#define DEFAULT_PRICE_SELL 25.50f
-#define DEFAULT_PRICE_COST 20.00f
-#define DEFAULT_CURRENCY "ZMW"
-
-// ========================= SAFETY LIMITS =========================
-#define MAX_PUMP_RUNTIME_MS 600000  // 10 minutes max pump runtime failsafe
-#define MAX_RECEIPT_SIZE 1500       // Maximum receipt JSON size for NVS queue
-#define WATCHDOG_TIMEOUT_S 8        // Hardware watchdog timeout
-#define MIN_PUMP_OFF_DELAY_MS 500   // Minimum delay between pump cycles (industrial safety)
-#define FLOW_DROP_THRESHOLD 0.4f    // 40% flow drop threshold
-#define FLOW_DROP_DURATION_MS 3000  // Flow drop duration before anomaly
-#define TAMPER_DEBOUNCE_MS 100      // Tamper switch debounce
-#define ENABLE_TAMPER_DETECTION false  // Set to true when tamper switch is connected
-// ==========================================================================
-
-#ifndef DEVICE_ID
-  #define DEVICE_ID "OIL-UNCONFIGURED"
-#endif
-#ifndef API_KEY
-  #define API_KEY "UNCONFIGURED"
-#endif
-#ifndef API_BASE_URL
-  #define API_BASE_URL "http://localhost:3000"
-#endif
-#ifndef SITE_NAME
-  #define SITE_NAME "UNNAMED_SITE"
-#endif
-
-// ========================= WIFI CONFIG =========================
+/* ================= WIFI ================= */
 const char* WIFI_SSID = "kupemisa";
 const char* WIFI_PASS = "123admin";
-// ================================================================
 
-// ========================= PINS =========================
-// Pump control
-static const int PIN_PUMP = 26;
-static const bool PUMP_ACTIVE_HIGH = true;
+/* ================= PRICING ================= */
+#define PRICE_PER_ML        0.045f
+#define STOP_MARGIN_LITERS  0.005f
 
-// Flow sensor pulse input (interrupt)
-static const int PIN_FLOW = 27;
+/* ================= ADMIN CREDENTIALS ================= */
+#define ADMIN_CODE     "0000"
+#define ADMIN_PIN      "1234"
+#define MAX_USERS      20
 
-// Tamper detection (cabinet open / wire cut)
-static const int PIN_TAMPER = 34;  // INPUT_ONLY pin (ADC1_CH6)
+/* ================= HARDWARE ================= */
+#define PIN_PUMP   23
+#define PIN_FLOW   34
+// Optional cabinet tamper switch (normally-closed to GND, opens on tamper)
+// Wire to PIN_TAMPER or tie to GND if unused
+#define PIN_TAMPER 35
 
-// I2C LCD pins (ESP32 default I2C)
-// SDA = GPIO 21
-// SCL = GPIO 22
+/* ================= RELAY ================= */
+#define RELAY_ACTIVE_LOW true
 
-// Keypad pins (safe, no boot strap issues)
-const byte ROWS = 4, COLS = 4;
-char keys[ROWS][COLS] = {
-  {'1','2','3','A'},
-  {'4','5','6','B'},
-  {'7','8','9','C'},
-  {'*','0','#','D'}
-};
-byte rowPins[ROWS] = {32, 33, 25, 14};
-byte colPins[COLS] = {13, 16, 17, 4};   // Use GPIO4 (safe) instead of GPIO15 (boot strap)
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+void relayOff() {
+  digitalWrite(PIN_PUMP, RELAY_ACTIVE_LOW ? HIGH : LOW);
+}
 
-// ========================= DISPLAY (16x2 I2C LCD) =========================
-// Common I2C addresses: 0x27 or 0x3F - try both if one doesn't work
+void relayOn() {
+  digitalWrite(PIN_PUMP, RELAY_ACTIVE_LOW ? LOW : HIGH);
+}
+
+/* ================= LED CONFIG ================= */
+#define PIN_LED_RED     4
+#define PIN_LED_GREEN   16
+#define PIN_LED_YELLOW  17
+
+void ledsIdle() {
+  digitalWrite(PIN_LED_RED, HIGH);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_YELLOW, LOW);
+}
+
+void ledsDispensing() {
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_LED_GREEN, HIGH);
+  digitalWrite(PIN_LED_YELLOW, LOW);
+}
+
+void ledsError() {
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_YELLOW, HIGH);
+}
+
+/* ================= LCD ================= */
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-// ========================= STORAGE =========================
+/* ================= SCROLLING TEXT ================= */
+String scrollText = "  WELCOME PIMISHA  ";
+int scrollPos = 0;
+unsigned long lastScrollMs = 0;
+
+void scrollWelcome() {
+  if (millis() - lastScrollMs >= 300) {
+    lastScrollMs = millis();
+    lcd.setCursor(0, 0);
+    String display = scrollText.substring(scrollPos, scrollPos + 16);
+    if (display.length() < 16) {
+      display += scrollText.substring(0, 16 - display.length());
+    }
+    lcd.print(display);
+    scrollPos++;
+    if (scrollPos >= scrollText.length()) scrollPos = 0;
+  }
+}
+
+/* ================= KEYPAD ================= */
+const byte ROWS = 4, COLS = 4;
+char keys[ROWS][COLS] = {
+  {'D','C','B','A'},
+  {'#','9','6','3'},
+  {'0','8','5','2'},
+  {'*','7','4','1'}
+};
+byte rowPins[ROWS] = {13, 12, 14, 27};
+byte colPins[COLS] = {26, 25, 33, 32};
+Keypad keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+/* ================= STORAGE ================= */
 Preferences prefs;
 
-// ========================= FLOW METER =========================
+/* ================= FLOW ================= */
 volatile uint32_t flowPulses = 0;
-float pulsesPerLiter = 450.0f;  // Calibrate for your sensor
-float dispensedLiters = 0.0f;
-float litersTotal = 0.0f;
-float flowLpm = 0.0f;
+float pulsesPerLiter = 450.0f;
+float dispensedLiters = 0;
+uint32_t lastPulse = 0;
 uint32_t lastFlowMs = 0;
-uint32_t lastPulseSnapshot = 0;
-uint32_t noFlowStartMs = 0;
-
-// Flow anomaly detection
-float lastFlowLpm = 0.0f;
-uint32_t flowDropStartMs = 0;
-bool flowAnomalyDetected = false;
-String flowAnomalyType = "";
-
-// Flow sensor ISR
 void IRAM_ATTR onFlowPulse() { flowPulses++; }
 
-// ========================= PRICING (from dashboard) =========================
-struct Price {
-  float sell = DEFAULT_PRICE_SELL;      // Selling price per liter
-  float cost = DEFAULT_PRICE_COST;      // Cost price per liter
-  char currency[8] = DEFAULT_CURRENCY;
-} price;
-
-// ========================= ONLINE/OFFLINE STATE =========================
-// isOnline is the SINGLE SOURCE OF TRUTH for connection status
-bool isOnline = false;
-
-// ========================= TAMPER DETECTION =========================
-bool tamperActive = false;
-uint32_t lastTamperCheckMs = 0;
-bool tamperLocked = false;  // Keypad locked due to tamper
-
-// ========================= SAFETY & COMPLIANCE =========================
-uint32_t lastPumpOffMs = 0;  // Track pump OFF time for minimum delay
-uint32_t watchdogResetTime = 0;  // Time of last watchdog reset
-bool watchdogResetDetected = false;
-String lastResetReason = "";
-
-// ========================= LOCAL OPERATOR CACHE =========================
-// Cache operators from dashboard for offline use (up to 5)
-// PINs are stored as SHA256 hashes, never in plain text
-struct CachedOperator {
-  char pinHash[65];   // SHA256 hash (64 hex chars + null)
-  char name[32];
-  char id[64];
-  char role[16];
-  bool valid;
+/* ================= SESSION ================= */
+enum Role { OPERATOR, SUPERVISOR, ADMIN };
+enum State {
+  ST_LOGIN_CODE,
+  ST_LOGIN_PIN,
+  ST_MENU,
+  ST_AMOUNT,
+  ST_READY,
+  ST_DISPENSING,
+  ST_ADMIN_MENU,
+  ST_ADD_USER_CODE,
+  ST_ADD_USER_PIN,
+  ST_ADD_USER_ROLE,
+  ST_DELETE_USER,
+  ST_LIST_USERS,
+  ST_CALIBRATE
 };
-static const int MAX_CACHED_OPS = 5;
-CachedOperator cachedOps[MAX_CACHED_OPS];
 
-// ========================= OPERATOR SESSION =========================
-struct OperatorSession {
+State state = ST_LOGIN_CODE;
+Role currentRole = OPERATOR;
+String newUserCode = "";
+String newUserPin = "";
+int listUserIdx = 0;
+
+struct Session {
   bool loggedIn = false;
-  String operatorId = "";
-  String operatorName = "";
-  String operatorRole = "";
+  String code = "";
+  Role role = OPERATOR;
 } session;
 
-// ========================= STATE MACHINE =========================
-enum State {
-  IDLE,              // Wait for operator login (Press A)
-  ENTER_PIN,         // Operator entering PIN
-  VERIFYING_PIN,     // Waiting for dashboard response
-  ENTER_LITERS,      // Operator entering target liters
-  CONFIRM_READY,     // Show target, wait for D to start
-  DISPENSING,        // Pump running, measuring flow
-  PAUSED,            // Pump paused (user pressed *)
-  COMPLETING,        // Sending sale to dashboard
-  RECEIPT,           // Show receipt
-  ERROR_STATE,       // Error occurred
-  ADMIN              // Admin menu
-};
-State state = IDLE;
+/* ================= VARS ================= */
+String inputBuf = "";
+String loginCode = "";
+float amountZmw = 0;
+float targetLiters = 0;
 
-// ========================= INPUT BUFFERS =========================
-String pinBuf = "";
-String litersBuf = "";
-String adminBuf = "";
-bool pendingAdminCheck = false;  // Flag for admin mode check after PIN
+// Dynamic pricing and configuration
+float pricePerMl = PRICE_PER_ML;
+float activePricePerLiter = PRICE_PER_ML * 1000.0f;
+bool calibrationMode = false;
+unsigned long lastConfigFetchMs = 0;
+String siteNameRuntime = SITE_NAME;
 
-// ========================= DISPENSING STATE =========================
-float targetLiters = 0.0f;
-uint32_t dispenseStartMs = 0;
-uint32_t dispenseStartUnix = 0;
-String lastError = "";
+// Time sync (Unix time) and per-sale session locking
+long long unixTimeOffsetMs = 0;   // unixMs ≈ millis() + offset
+bool hasTimeSync = false;
+String currentSessionId = "";
+unsigned long sessionStartMs = 0;
+float sessionTargetLiters = 0.0f;
+float sessionPricePerMl = PRICE_PER_ML;
+unsigned long sessionCounter = 0;
+String lastLoginPin = "";
 
-// ========================= TIMERS =========================
-uint32_t lastUiMs = 0;
-uint32_t lastTelemetryMs = 0;
-uint32_t lastReceiptRetryMs = 0;
-uint32_t lastScrollMs = 0;
-uint32_t lastLitersSaveMs = 0;
-int scrollPos = 0;
+// Tamper detection
+bool tamperLatched = false;
 
-static const uint32_t UI_MS = 300;
-static const uint32_t TELEMETRY_MS = 10000;
-static const uint32_t RETRY_MS = 8000;
-static const uint32_t SCROLL_MS = 400;
-static const uint32_t LITERS_SAVE_MS = 60000;  // Save litersTotal every 60s
+/* ================= NETWORK ================= */
+WiFiClientSecure secureClient;
+bool isOnline = false;
 
-// ========================= RECEIPT QUEUE =========================
-static const int QSIZE = 20;
+/* ================= RECEIPT QUEUE ================= */
+#define QMAX 10
+void queueReceipt(const String& body) {
+  prefs.begin("queue", false);
+  int h = prefs.getInt("h", 0);
+  int t = prefs.getInt("t", 0);
+  prefs.putString(("r" + String(h % QMAX)).c_str(), body);
+  prefs.putInt("h", h + 1);
+  if (h - t >= QMAX) prefs.putInt("t", t + 1);
+  prefs.end();
+}
 
-// ========================= SHA256 HASH FUNCTION =========================
-String sha256Hash(const String& input) {
-  unsigned char hash[32];
+void resendQueue() {
+  if (!isOnline) return;
+  prefs.begin("queue", true);
+  int h = prefs.getInt("h", 0);
+  int t = prefs.getInt("t", 0);
+  if (h == t) { prefs.end(); return; }
+  String body = prefs.getString(("r" + String(t % QMAX)).c_str(), "");
+  prefs.end();
+
+  HTTPClient http;
+  secureClient.setInsecure();
+  http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/receipt");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-api-key", API_KEY);
+  int code = http.POST(body);
+  http.end();
+
+  if (code >= 200 && code < 300) {
+    prefs.begin("queue", false);
+    prefs.putInt("t", t + 1);
+    prefs.end();
+  }
+}
+
+/* ================= SEND RECEIPT TO DASHBOARD ================= */
+void sendReceipt(float mlDispensed, float amountPaid, float targetMl, const char* status) {
+  // Compute timing based on synced Unix time if available
+  unsigned long nowMs = millis();
+  long long startedAtUnixSec;
+  long long endedAtUnixSec;
+  if (hasTimeSync) {
+    startedAtUnixSec = (unixTimeOffsetMs + (long long)sessionStartMs) / 1000LL;
+    endedAtUnixSec   = (unixTimeOffsetMs + (long long)nowMs) / 1000LL;
+  } else {
+    // Fallback: derive from millis (not real wall clock but monotonic)
+    startedAtUnixSec = (long long)sessionStartMs / 1000LL;
+    endedAtUnixSec   = (long long)nowMs / 1000LL;
+  }
+
+  float dispLiters = mlDispensed / 1000.0f;
+  float tgtLiters  = (targetMl > 0.0f) ? (targetMl / 1000.0f) : sessionTargetLiters;
+  int durationSec  = (int)((nowMs - sessionStartMs) / 1000UL);
+
+  StaticJsonDocument<512> doc;
+  // New schema fields for /api/ingest/receipt
+  doc["sessionId"]      = currentSessionId;
+  doc["operatorPin"]    = lastLoginPin;  // backend matches this against pin hashes
+  doc["targetLiters"]   = tgtLiters;
+  doc["dispensedLiters"] = dispLiters;
+  doc["durationSec"]    = durationSec;
+  doc["status"]         = status;        // DONE | ERROR | CANCELED
+  doc["startedAtUnix"]  = startedAtUnixSec;
+  doc["endedAtUnix"]    = endedAtUnixSec;
+
+  // Backward/diagnostic fields (ignored by strict schema but useful for debugging)
+  doc["deviceId"]       = DEVICE_ID;
+  doc["siteName"]       = siteNameRuntime;
+  doc["operatorCode"]   = loginCode;
+  doc["volumeMl"]       = (int)mlDispensed;
+  doc["targetVolumeMl"] = (int)targetMl;
+  doc["amountZmw"]      = amountPaid;
+  doc["pricePerLiter"]  = activePricePerLiter;
+  doc["pricePerMl"]     = sessionPricePerMl;
+  doc["pulsesPerLiter"] = pulsesPerLiter;
+  
+  String body;
+  serializeJson(doc, body);
+  
+  Serial.println("[RECEIPT] " + body);
+  
+  if (isOnline) {
+    HTTPClient http;
+    secureClient.setInsecure();
+    http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/receipt");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-id", DEVICE_ID);
+    http.addHeader("x-api-key", API_KEY);
+    int code = http.POST(body);
+    Serial.printf("[HTTP] Receipt response: %d\n", code);
+    http.end();
+    
+    if (code < 200 || code >= 300) {
+      queueReceipt(body);  // Queue if failed
+    }
+  } else {
+    queueReceipt(body);  // Queue if offline
+  }
+}
+
+/* ================= HEARTBEAT TO DASHBOARD ================= */
+unsigned long lastHeartbeat = 0;
+
+void sendHeartbeat() {
+  if (!isOnline) return;
+  if (millis() - lastHeartbeat < 30000) return;  // Every 30 seconds
+  lastHeartbeat = millis();
+  
+  StaticJsonDocument<256> doc;
+  doc["deviceId"] = DEVICE_ID;
+  doc["siteName"] = siteNameRuntime;
+  doc["status"] = (state == ST_DISPENSING) ? "dispensing" : "idle";
+  doc["uptime"] = millis() / 1000;
+  
+  String body;
+  serializeJson(doc, body);
+  
+  HTTPClient http;
+  secureClient.setInsecure();
+  http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/heartbeat");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-api-key", API_KEY);
+  int code = http.POST(body);
+  Serial.printf("[HEARTBEAT] Response: %d\n", code);
+  http.end();
+}
+
+/* ================= HELPERS ================= */
+void lcdShow(const String& a, const String& b = "") {
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print(a.substring(0, 16));
+  lcd.setCursor(0, 1); lcd.print(b.substring(0, 16));
+}
+
+float round2(float v) {
+  long scaled = (long)(v * 100.0f + 0.5f);
+  return scaled / 100.0f;
+}
+
+void sendTamperEvent() {
+  StaticJsonDocument<256> doc;
+  long long tsMs;
+  if (hasTimeSync) {
+    tsMs = unixTimeOffsetMs + (long long)millis();
+  } else {
+    tsMs = (long long)millis();
+  }
+  doc["ts"] = tsMs;
+  doc["type"] = "TAMPER_OPEN";
+  doc["severity"] = "CRITICAL";
+  doc["message"] = "Cabinet tamper switch opened";
+
+  String body;
+  serializeJson(doc, body);
+
+  HTTPClient http;
+  secureClient.setInsecure();
+  http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/event");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-api-key", API_KEY);
+  int code = http.POST(body);
+  Serial.printf("[TAMPER] Event response: %d\n", code);
+  http.end();
+}
+
+void checkTamper() {
+  static unsigned long lastTamperCheck = 0;
+  unsigned long now = millis();
+  if (now - lastTamperCheck < 50) return;  // simple debounce
+  lastTamperCheck = now;
+
+  int val = digitalRead(PIN_TAMPER);
+  if (val == HIGH && !tamperLatched) {
+    // Tamper triggered (cabinet open)
+    tamperLatched = true;
+    relayOff();
+    ledsError();
+
+    if (isOnline) {
+      sendTamperEvent();
+    }
+
+    // Force logout and show alarm
+    state = ST_LOGIN_CODE;
+    inputBuf = "";
+    amountZmw = 0;
+    dispensedLiters = 0;
+    lcdShow("TAMPER", "CABINET OPEN");
+  }
+}
+
+/* ================= DEVICE CONFIG (PRICE / DISPLAY) ================= */
+void fetchDeviceConfig() {
+  if (!isOnline) return;
+  const unsigned long CONFIG_REFRESH_INTERVAL_MS = 60000; // 60s
+  unsigned long now = millis();
+  if (lastConfigFetchMs != 0 && (now - lastConfigFetchMs) < CONFIG_REFRESH_INTERVAL_MS) return;
+  lastConfigFetchMs = now;
+
+  HTTPClient http;
+  secureClient.setInsecure();
+  http.begin(secureClient, String(API_BASE_URL) + "/api/device/config");
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-api-key", API_KEY);
+  int code = http.GET();
+  if (code != 200) {
+    http.end();
+    Serial.printf("[CONFIG] HTTP %d\n", code);
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.println("[CONFIG] JSON parse error");
+    return;
+  }
+
+  float newPricePerLiter = doc["price"]["pricePerLiter"] | 0.0f;
+  if (newPricePerLiter > 0.0f) {
+    activePricePerLiter = newPricePerLiter;
+    pricePerMl = newPricePerLiter / 1000.0f;
+    Serial.printf("[CONFIG] Price %.2f ZMW/L\n", newPricePerLiter);
+  }
+
+  const char* newSite = doc["siteName"]; 
+  if (newSite && strlen(newSite) > 0) {
+    siteNameRuntime = String(newSite);
+  }
+
+  // Sync approximate Unix time for price-by-date and reporting
+  long long serverTs = doc["timestamp"] | 0LL;  // ms since epoch from backend
+  if (serverTs > 0) {
+    unixTimeOffsetMs = serverTs - (long long)millis();
+    hasTimeSync = true;
+    Serial.printf("[CONFIG] Time sync offset=%lld ms\n", unixTimeOffsetMs);
+  }
+}
+
+String sha256(const String& s) {
+  byte hash[32];
+  char out[65];
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);  // 0 = SHA-256 (not SHA-224)
-  mbedtls_sha256_update(&ctx, (const unsigned char*)input.c_str(), input.length());
+  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_update(&ctx, (const unsigned char*)s.c_str(), s.length());
   mbedtls_sha256_finish(&ctx, hash);
   mbedtls_sha256_free(&ctx);
+  for (int i = 0; i < 32; i++) sprintf(out + i * 2, "%02x", hash[i]);
+  out[64] = 0;
+  return String(out);
+}
+
+/* ================= USER MANAGEMENT ================= */
+int getUserCount() {
+  prefs.begin("users", true);
+  int count = prefs.getInt("count", 0);
+  prefs.end();
+  return count;
+}
+
+/* ================= USER SYNC QUEUE ================= */
+void queueUserSync(const String& body) {
+  prefs.begin("usync", false);
+  int h = prefs.getInt("h", 0);
+  int t = prefs.getInt("t", 0);
+  prefs.putString(("u" + String(h % 10)).c_str(), body);
+  prefs.putInt("h", h + 1);
+  if (h - t >= 10) prefs.putInt("t", t + 1);
+  prefs.end();
+  Serial.println("[QUEUE] User sync queued");
+}
+
+void resendUserSyncQueue() {
+  if (!isOnline) return;
+  prefs.begin("usync", true);
+  int h = prefs.getInt("h", 0);
+  int t = prefs.getInt("t", 0);
+  if (h == t) { prefs.end(); return; }
+  String body = prefs.getString(("u" + String(t % 10)).c_str(), "");
+  prefs.end();
   
-  // Convert to hex string
-  char hexStr[65];
-  for (int i = 0; i < 32; i++) {
-    sprintf(&hexStr[i * 2], "%02x", hash[i]);
-  }
-  hexStr[64] = '\0';
-  return String(hexStr);
-}
+  if (body.length() == 0) return;
 
-// ========================= AUDIT CHECKSUM GENERATION =========================
-String generateAuditChecksum(const String& deviceId, const String& operatorId,
-                             float targetLiters, float dispensedLiters,
-                             float pricePerLiter, uint32_t startUnix, uint32_t endUnix) {
-  // Concatenate all transaction data for tamper-proof checksum
-  String data = deviceId + "|" + operatorId + "|" + 
-                String(targetLiters, 3) + "|" + String(dispensedLiters, 3) + "|" +
-                String(pricePerLiter, 2) + "|" + String(startUnix) + "|" + String(endUnix);
-  return sha256Hash(data);
-}
+  HTTPClient http;
+  secureClient.setInsecure();
+  http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/operator");
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", DEVICE_ID);
+  http.addHeader("x-api-key", API_KEY);
+  int httpCode = http.POST(body);
+  http.end();
 
-// ========================= WATCHDOG FUNCTIONS =========================
-void initWatchdog() {
-  esp_task_wdt_init(WATCHDOG_TIMEOUT_S, true);  // Enable panic so ESP32 resets
-  esp_task_wdt_add(NULL);  // Add current thread to WDT watch
-  Serial.printf("[SAFETY] Watchdog enabled: %d seconds timeout\n", WATCHDOG_TIMEOUT_S);
-}
-
-void feedWatchdog() {
-  esp_task_wdt_reset();
-}
-
-String getResetReason() {
-  RESET_REASON reason = rtc_get_reset_reason(0);
-  switch (reason) {
-    case POWERON_RESET: return "POWER_ON";
-    case SW_RESET: return "SOFTWARE";
-    case OWDT_RESET: return "WATCHDOG";
-    case DEEPSLEEP_RESET: return "DEEP_SLEEP";
-    case SDIO_RESET: return "SDIO";
-    case TG0WDT_SYS_RESET: return "WATCHDOG_TG0";
-    case TG1WDT_SYS_RESET: return "WATCHDOG_TG1";
-    case RTCWDT_SYS_RESET: return "WATCHDOG_RTC";
-    case INTRUSION_RESET: return "INTRUSION";
-    case TGWDT_CPU_RESET: return "WATCHDOG_CPU";
-    case SW_CPU_RESET: return "SOFTWARE_CPU";
-    case RTCWDT_CPU_RESET: return "WATCHDOG_RTC_CPU";
-    case EXT_CPU_RESET: return "EXTERNAL_CPU";
-    case RTCWDT_BROWN_OUT_RESET: return "BROWNOUT";
-    case RTCWDT_RTC_RESET: return "WATCHDOG_RTC_RESET";
-    default: return "UNKNOWN";
-  }
-}
-
-// ========================= TAMPER DETECTION =========================
-void checkTamper() {
-  if (!ENABLE_TAMPER_DETECTION) return;  // Skip if tamper detection disabled
-  
-  if (millis() - lastTamperCheckMs < TAMPER_DEBOUNCE_MS) return;
-  lastTamperCheckMs = millis();
-  
-  // Tamper pin: LOW = tampered, HIGH = normal (pull-up)
-  int tamperState = digitalRead(PIN_TAMPER);
-  
-  if (tamperState == LOW && !tamperActive) {
-    // Tamper detected!
-    tamperActive = true;
-    tamperLocked = true;
-    pumpSet(false);  // Emergency stop
-    lastError = "TAMPER: Cabinet opened";
-    Serial.println("[SECURITY] TAMPER DETECTED - Cabinet opened or wire cut");
-    state = ERROR_STATE;
+  if (httpCode >= 200 && httpCode < 300) {
+    prefs.begin("usync", false);
+    prefs.putInt("t", t + 1);
+    prefs.end();
+    Serial.println("[QUEUE] User sync sent successfully");
   }
 }
 
-bool canStartPump() {
-  // Industrial safety checks before pump start
-  if (tamperActive) {
-    Serial.println("[SAFETY] Pump start blocked: Tamper active");
+/* ================= SYNC USER TO DASHBOARD ================= */
+void syncUserToDashboard(const String& code, const String& pin, Role role, bool isDelete) {
+  StaticJsonDocument<256> doc;
+  doc["deviceId"] = DEVICE_ID;
+  doc["siteName"] = SITE_NAME;
+  doc["operatorCode"] = code;
+  doc["pin"] = pin;  // Send hashed in production
+  doc["role"] = (role == SUPERVISOR) ? "supervisor" : "operator";
+  doc["action"] = isDelete ? "delete" : "add";
+  doc["timestamp"] = millis();
+  
+  String body;
+  serializeJson(doc, body);
+  
+  Serial.println("[USER_SYNC] " + body);
+  
+  if (isOnline) {
+    HTTPClient http;
+    secureClient.setInsecure();
+    http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/operator");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-id", DEVICE_ID);
+    http.addHeader("x-api-key", API_KEY);
+    int httpCode = http.POST(body);
+    Serial.printf("[HTTP] User sync response: %d\n", httpCode);
+    http.end();
+    
+    if (httpCode < 200 || httpCode >= 300) {
+      queueUserSync(body);
+    }
+  } else {
+    queueUserSync(body);
+  }
+}
+
+bool addUser(const String& code, const String& pin, Role role) {
+  prefs.begin("users", false);
+  int count = prefs.getInt("count", 0);
+  if (count >= MAX_USERS) {
+    prefs.end();
     return false;
   }
-  
-  if (watchdogResetDetected && (millis() - watchdogResetTime < 30000)) {
-    Serial.println("[SAFETY] Pump start blocked: Recent watchdog reset");
-    return false;
+  // Check if code already exists
+  for (int i = 0; i < count; i++) {
+    String existingCode = prefs.getString(("c" + String(i)).c_str(), "");
+    if (existingCode == code) {
+      prefs.end();
+      return false;  // Code already exists
+    }
   }
+  // Store new user
+  prefs.putString(("c" + String(count)).c_str(), code);
+  prefs.putString(("p" + String(count)).c_str(), pin);
+  prefs.putInt(("r" + String(count)).c_str(), (int)role);
+  prefs.putInt("count", count + 1);
+  prefs.end();
+  Serial.printf("[USER] Added: %s role=%d\n", code.c_str(), role);
   
-  // Minimum OFF delay between pump cycles
-  if (millis() - lastPumpOffMs < MIN_PUMP_OFF_DELAY_MS) {
-    Serial.println("[SAFETY] Pump start blocked: Minimum OFF delay not met");
-    return false;
-  }
+  // Sync to dashboard
+  syncUserToDashboard(code, pin, role, false);
   
   return true;
 }
 
-void safePumpSet(bool on) {
-  if (on && !canStartPump()) {
-    Serial.println("[SAFETY] Pump start denied by safety system");
-    return;
-  }
-  
-  if (!on) {
-    lastPumpOffMs = millis();  // Track OFF time
-  }
-  
-  pumpSet(on);
-}
-
-// ========================= FLOW ANOMALY DETECTION =========================
-void detectFlowAnomalies() {
-  bool isPumpOn = pumpOn();
-  uint32_t now = millis();
-  
-  // 1. Flow detected while pump is OFF (bypass or leak)
-  if (!isPumpOn && flowLpm > 0.5f) {
-    flowAnomalyDetected = true;
-    flowAnomalyType = "FLOW_WHILE_PUMP_OFF";
-    safePumpSet(false);
-    lastError = "Anomaly: Flow detected with pump OFF";
-    Serial.println("[ANOMALY] Flow detected while pump OFF - possible bypass");
-    state = ERROR_STATE;
-    return;
-  }
-  
-  // 2. Sudden pulse spike (possible meter tampering)
-  if (state == DISPENSING && flowLpm > lastFlowLpm * 3.0f && lastFlowLpm > 0.1f) {
-    flowAnomalyDetected = true;
-    flowAnomalyType = "SUDDEN_SPIKE";
-    safePumpSet(false);
-    lastError = "Anomaly: Sudden flow spike";
-    Serial.println("[ANOMALY] Sudden flow spike detected");
-    state = ERROR_STATE;
-    return;
-  }
-  
-  // 3. Flow drop >40% for >3 seconds while pump ON
-  if (isPumpOn && state == DISPENSING) {
-    if (lastFlowLpm > 0.1f && flowLpm < lastFlowLpm * (1.0f - FLOW_DROP_THRESHOLD)) {
-      if (flowDropStartMs == 0) {
-        flowDropStartMs = now;
-      } else if (now - flowDropStartMs > FLOW_DROP_DURATION_MS) {
-        flowAnomalyDetected = true;
-        flowAnomalyType = "FLOW_DROP_SUSTAINED";
-        safePumpSet(false);
-        lastError = "Anomaly: Sustained flow drop";
-        Serial.println("[ANOMALY] Sustained flow drop detected");
-        state = ERROR_STATE;
-        return;
-      }
-    } else {
-      flowDropStartMs = 0;  // Reset if flow recovered
-    }
-  }
-  
-  lastFlowLpm = flowLpm;
-}
-
-// ========================= UTIL FUNCTIONS =========================
-bool isCloudEnabled() {
-  return String(API_KEY) != "UNCONFIGURED" && String(API_BASE_URL).length() > 8;
-}
-
-// Update isOnline - this is the single source of truth
-void updateOnlineStatus() {
-  isOnline = (WiFi.status() == WL_CONNECTED);
-}
-
-void pumpSet(bool on) {
-  if (PUMP_ACTIVE_HIGH) digitalWrite(PIN_PUMP, on ? HIGH : LOW);
-  else digitalWrite(PIN_PUMP, on ? LOW : HIGH);
-}
-
-bool pumpOn() {
-  int v = digitalRead(PIN_PUMP);
-  return PUMP_ACTIVE_HIGH ? (v == HIGH) : (v == LOW);
-}
-
-String baseUrl() {
-  String b = String(API_BASE_URL);
-  if (b.endsWith("/")) b.remove(b.length()-1);
-  return b;
-}
-
-String endpoint(const char* path) {
-  return baseUrl() + String(path);
-}
-
-uint32_t unixNow() {
-  time_t now = time(nullptr);
-  if (now < 1700000000) return 0;
-  return (uint32_t)now;
-}
-
-String money(float v) {
-  char buf[32];
-  snprintf(buf, sizeof(buf), "%s %.2f", price.currency, v);
-  return String(buf);
-}
-
-// ========================= LOCAL OPERATOR CACHE FUNCTIONS =========================
-void initOfflineOperators() {
-  // Initialize with hardcoded fallback operators (hashed PINs)
-  memset(cachedOps, 0, sizeof(cachedOps));
-  
-  // Operator 1 - PIN hash already computed
-  strncpy(cachedOps[0].pinHash, OFFLINE_HASH_1, 64);
-  cachedOps[0].pinHash[64] = '\0';
-  strncpy(cachedOps[0].name, OFFLINE_NAME_1, 31);
-  strncpy(cachedOps[0].id, "offline-1", 63);
-  strncpy(cachedOps[0].role, OFFLINE_ROLE_1, 15);
-  cachedOps[0].valid = true;
-  
-  // Operator 2
-  strncpy(cachedOps[1].pinHash, OFFLINE_HASH_2, 64);
-  cachedOps[1].pinHash[64] = '\0';
-  strncpy(cachedOps[1].name, OFFLINE_NAME_2, 31);
-  strncpy(cachedOps[1].id, "offline-2", 63);
-  strncpy(cachedOps[1].role, OFFLINE_ROLE_2, 15);
-  cachedOps[1].valid = true;
-  
-  // Operator 3 (Admin/Supervisor)
-  strncpy(cachedOps[2].pinHash, OFFLINE_HASH_3, 64);
-  cachedOps[2].pinHash[64] = '\0';
-  strncpy(cachedOps[2].name, OFFLINE_NAME_3, 31);
-  strncpy(cachedOps[2].id, "offline-3", 63);
-  strncpy(cachedOps[2].role, OFFLINE_ROLE_3, 15);
-  cachedOps[2].valid = true;
-  
-  // Load any cached operators from NVS (from previous online sessions)
-  loadCachedOperators();
-}
-
-void loadCachedOperators() {
-  prefs.begin("ops", true);
-  for (int i = 0; i < MAX_CACHED_OPS; i++) {
-    String keyHash = "h" + String(i);  // Changed from "p" to "h" for hash
-    String keyName = "n" + String(i);
-    String keyId = "i" + String(i);
-    String keyRole = "r" + String(i);
-    
-    String pinHash = prefs.getString(keyHash.c_str(), "");
-    String name = prefs.getString(keyName.c_str(), "");
-    String id = prefs.getString(keyId.c_str(), "");
-    String role = prefs.getString(keyRole.c_str(), "operator");
-    
-    // Only load if hash is valid length (64 chars for SHA256)
-    if (pinHash.length() == 64 && name.length() > 0) {
-      pinHash.toCharArray(cachedOps[i].pinHash, 65);
-      name.toCharArray(cachedOps[i].name, 32);
-      id.toCharArray(cachedOps[i].id, 64);
-      role.toCharArray(cachedOps[i].role, 16);
-      cachedOps[i].valid = true;
-    }
-  }
-  prefs.end();
-}
-
-void cacheOperator(const String& pin, const String& name, const String& id, const String& role) {
-  // Hash the PIN before storing
-  String pinHash = sha256Hash(pin);
-  
-  // Find empty slot or overwrite oldest
-  int slot = -1;
-  for (int i = 0; i < MAX_CACHED_OPS; i++) {
-    if (!cachedOps[i].valid || String(cachedOps[i].pinHash) == pinHash) {
-      slot = i;
+bool deleteUser(const String& code) {
+  prefs.begin("users", false);
+  int count = prefs.getInt("count", 0);
+  int foundIdx = -1;
+  Role deletedRole = OPERATOR;
+  for (int i = 0; i < count; i++) {
+    if (prefs.getString(("c" + String(i)).c_str(), "") == code) {
+      foundIdx = i;
+      deletedRole = (Role)prefs.getInt(("r" + String(i)).c_str(), 0);
       break;
     }
   }
-  if (slot < 0) slot = MAX_CACHED_OPS - 1;  // Overwrite last
-  
-  pinHash.toCharArray(cachedOps[slot].pinHash, 65);
-  name.toCharArray(cachedOps[slot].name, 32);
-  id.toCharArray(cachedOps[slot].id, 64);
-  role.toCharArray(cachedOps[slot].role, 16);
-  cachedOps[slot].valid = true;
-  
-  // Save to NVS (hash only, never plain PIN)
-  prefs.begin("ops", false);
-  String keyHash = "h" + String(slot);
-  String keyName = "n" + String(slot);
-  String keyId = "i" + String(slot);
-  String keyRole = "r" + String(slot);
-  prefs.putString(keyHash.c_str(), pinHash);
-  prefs.putString(keyName.c_str(), name);
-  prefs.putString(keyId.c_str(), id);
-  prefs.putString(keyRole.c_str(), role);
-  prefs.end();
-}
-
-bool verifyPinOffline(const String& pin) {
-  // Hash the entered PIN and compare with stored hashes
-  String enteredHash = sha256Hash(pin);
-  
-  for (int i = 0; i < MAX_CACHED_OPS; i++) {
-    if (cachedOps[i].valid && String(cachedOps[i].pinHash) == enteredHash) {
-      session.operatorId = String(cachedOps[i].id);
-      session.operatorName = String(cachedOps[i].name);
-      session.operatorRole = String(cachedOps[i].role);
-      session.loggedIn = true;
-      return true;
-    }
-  }
-  return false;
-}
-
-// Check if operator has admin/supervisor role
-bool isAdminRole(const String& role) {
-  String r = role;
-  r.toLowerCase();
-  return (r == "admin" || r == "supervisor" || r == "SUPERVISOR" || r == "Admin");
-}
-
-// ========================= SESSION MANAGEMENT =========================
-void clearSession() {
-  session.loggedIn = false;
-  session.operatorId = "";
-  session.operatorName = "";
-  session.operatorRole = "";
-  pinBuf = "";
-  litersBuf = "";
-  targetLiters = 0.0f;
-  dispensedLiters = 0.0f;
-  pendingAdminCheck = false;
-  
-  // Clear flow anomaly (but not tamper - requires admin)
-  if (!tamperActive) {
-    flowAnomalyDetected = false;
-    flowAnomalyType = "";
-  }
-}
-
-// ========================= LCD HELPER FUNCTIONS =========================
-void lcdClear() {
-  lcd.clear();
-}
-
-void lcdPrint(int col, int row, const char* text) {
-  lcd.setCursor(col, row);
-  lcd.print(text);
-}
-
-void lcdPrint(int col, int row, String text) {
-  lcd.setCursor(col, row);
-  lcd.print(text);
-}
-
-void lcdPrintCenter(int row, const char* text) {
-  int len = strlen(text);
-  int col = (16 - len) / 2;
-  if (col < 0) col = 0;
-  lcd.setCursor(col, row);
-  lcd.print(text);
-}
-
-void lcdPrintCenter(int row, String text) {
-  lcdPrintCenter(row, text.c_str());
-}
-
-// Scroll long text on LCD (for names, messages)
-String scrollText(String text, int maxLen, int& pos) {
-  if (text.length() <= maxLen) return text;
-  
-  String padded = text + "   " + text;  // Loop scroll
-  if (pos >= text.length() + 3) pos = 0;
-  
-  return padded.substring(pos, pos + maxLen);
-}
-
-// ========================= UI FUNCTIONS (16x2 LCD) =========================
-void uiIdle() {
-  lcdClear();
-  lcdPrintCenter(0, "PRESS A LOGIN");
-  
-  // Show WiFi status and price using isOnline (single source of truth)
-  if (isOnline) {
-    if (price.sell > 0) {
-      char buf[17];
-      snprintf(buf, sizeof(buf), "%.2f/L %s", price.sell, price.currency);
-      lcdPrintCenter(1, buf);
-    } else {
-      lcdPrintCenter(1, "Online NoPrice");
-    }
-  } else {
-    // Offline mode - show price if available
-    if (price.sell > 0) {
-      char buf[17];
-      snprintf(buf, sizeof(buf), "OFF %.2f%s", price.sell, price.currency);
-      lcdPrintCenter(1, buf);
-    } else {
-      lcdPrintCenter(1, "OFFLINE MODE");
-    }
-  }
-}
-
-void uiEnterPin() {
-  lcdClear();
-  // Show online/offline indicator using isOnline
-  if (isOnline) {
-    lcdPrint(0, 0, "PIN:");
-  } else {
-    lcdPrint(0, 0, "[OFF]PIN:");
-  }
-  
-  // Show masked PIN
-  String masked;
-  for (unsigned int i = 0; i < pinBuf.length(); i++) masked += "*";
-  lcdPrint(0, 1, masked);
-  
-  // Show cursor position
-  lcd.setCursor(pinBuf.length(), 1);
-  lcd.cursor();
-}
-
-void uiVerifyingPin() {
-  lcdClear();
-  if (isOnline) {
-    lcdPrintCenter(0, "VERIFYING...");
-    lcdPrintCenter(1, "Online check");
-  } else {
-    lcdPrintCenter(0, "CHECKING...");
-    lcdPrintCenter(1, "Local verify");
-  }
-  lcd.noCursor();
-}
-
-void uiEnterLiters() {
-  lcdClear();
-  
-  // Scroll operator name if too long
-  String opName = scrollText(session.operatorName, 10, scrollPos);
-  char line0[17];
-  snprintf(line0, sizeof(line0), "Op:%s", opName.c_str());
-  lcdPrint(0, 0, line0);
-  
-  // Show liters entry
-  char line1[17];
-  snprintf(line1, sizeof(line1), "Liters:%s_", litersBuf.c_str());
-  lcdPrint(0, 1, line1);
-}
-
-void uiConfirmReady() {
-  lcdClear();
-  
-  float total = targetLiters * price.sell;
-  char line0[17];
-  snprintf(line0, sizeof(line0), "%.1fL=%.2f%s", targetLiters, total, price.currency);
-  lcdPrint(0, 0, line0);
-  
-  lcdPrintCenter(1, "D=START *=CANCEL");
-}
-
-void uiDispense() {
-  lcdClear();
-  
-  // Line 0: Target and Dispensed
-  char line0[17];
-  snprintf(line0, sizeof(line0), "T:%.1f D:%.2fL", targetLiters, dispensedLiters);
-  lcdPrint(0, 0, line0);
-  
-  // Line 1: Remaining and flow rate
-  float remaining = targetLiters - dispensedLiters;
-  if (remaining < 0) remaining = 0;
-  char line1[17];
-  snprintf(line1, sizeof(line1), "R:%.1fL %.1fL/m", remaining, flowLpm);
-  lcdPrint(0, 1, line1);
-}
-
-void uiPaused() {
-  lcdClear();
-  lcdPrintCenter(0, "PAUSED");
-  
-  char line1[17];
-  snprintf(line1, sizeof(line1), "#=GO *=CANCEL");
-  lcdPrintCenter(1, line1);
-}
-
-void uiCompleting() {
-  lcdClear();
-  lcdPrintCenter(0, "COMPLETING...");
-  lcdPrintCenter(1, "Sending data");
-}
-
-void uiReceipt() {
-  lcdClear();
-  
-  // Alternate between showing liters and total
-  static bool showTotal = false;
-  if (millis() - lastScrollMs > 2000) {
-    showTotal = !showTotal;
-    lastScrollMs = millis();
-  }
-  
-  if (showTotal) {
-    float total = dispensedLiters * price.sell;
-    char line0[17];
-    snprintf(line0, sizeof(line0), "TOTAL:%.2f%s", total, price.currency);
-    lcdPrint(0, 0, line0);
-  } else {
-    char line0[17];
-    snprintf(line0, sizeof(line0), "DONE:%.2f L", dispensedLiters);
-    lcdPrint(0, 0, line0);
-  }
-  
-  lcdPrintCenter(1, "# = FINISH");
-}
-
-void uiError() {
-  lcdClear();
-  
-  if (tamperActive) {
-    lcdPrintCenter(0, "TAMPER DETECTED!");
-    lcdPrintCenter(1, "ADMIN PIN REQ");
-  } else if (flowAnomalyDetected) {
-    lcdPrintCenter(0, "FLOW ANOMALY!");
-    String errMsg = scrollText(flowAnomalyType, 16, scrollPos);
-    lcdPrint(0, 1, errMsg);
-  } else {
-    lcdPrintCenter(0, "ERROR!");
-    // Scroll error message if too long
-    String errMsg = scrollText(lastError, 16, scrollPos);
-    lcdPrint(0, 1, errMsg);
-  }
-}
-
-// ========================= ADMIN UI =========================
-enum AdminMode { AMENU, A_SELL, A_COST, A_CAL, A_TAMPER_CLEAR };
-AdminMode am = AMENU;
-
-void uiAdminMenu() {
-  lcdClear();
-  if (tamperActive) {
-    lcdPrint(0, 0, "ADMIN: D=CLEAR");
-    lcdPrint(0, 1, "TAMPER *=EXIT");
-  } else {
-    lcdPrint(0, 0, "ADMIN: A=SELL");
-    lcdPrint(0, 1, "B=COST C=CAL *=X");
-  }
-}
-
-void uiAdminInput(const char* label) {
-  lcdClear();
-  lcdPrint(0, 0, label);
-  lcdPrint(0, 1, adminBuf);
-  lcd.setCursor(adminBuf.length(), 1);
-  lcd.cursor();
-}
-
-// ========================= NVS STORAGE =========================
-void loadSettings() {
-  // Load pricing (local fallback, dashboard takes precedence)
-  prefs.begin("price", true);
-  price.sell = prefs.getFloat("sell", price.sell);
-  price.cost = prefs.getFloat("cost", price.cost);
-  String cur = prefs.getString("cur", "ZMW");
-  memset(price.currency, 0, sizeof(price.currency));
-  cur.toCharArray(price.currency, sizeof(price.currency));
-  prefs.end();
-
-  // Load flow calibration
-  prefs.begin("flow", true);
-  pulsesPerLiter = prefs.getFloat("ppl", pulsesPerLiter);
-  prefs.end();
-  
-  // Load litersTotal from NVS
-  prefs.begin("meter", true);
-  litersTotal = prefs.getFloat("total", 0.0f);
-  prefs.end();
-
-  // Initialize receipt queue
-  prefs.begin("rq", false);
-  if (!prefs.isKey("head")) prefs.putUInt("head", 0);
-  if (!prefs.isKey("tail")) prefs.putUInt("tail", 0);
-  prefs.end();
-}
-
-void savePricing() {
-  prefs.begin("price", false);
-  prefs.putFloat("sell", price.sell);
-  prefs.putFloat("cost", price.cost);
-  prefs.putString("cur", String(price.currency));
-  prefs.end();
-}
-
-void saveLitersTotal() {
-  prefs.begin("meter", false);
-  prefs.putFloat("total", litersTotal);
-  prefs.end();
-}
-
-// ========================= RECEIPT QUEUE =========================
-void qPush(const String& json) {
-  // Protect against oversized payloads
-  if (json.length() > MAX_RECEIPT_SIZE) {
-    Serial.printf("[WARN] Receipt too large (%d bytes), truncating\n", json.length());
-    // Still try to save a truncated version with essential fields
-    StaticJsonDocument<512> minDoc;
-    minDoc["sessionId"] = sessionId();
-    minDoc["deviceId"] = String(DEVICE_ID);
-    minDoc["dispensedLiters"] = dispensedLiters;
-    minDoc["status"] = "TRUNCATED";
-    minDoc["ts"] = unixNow();
-    String minJson;
-    serializeJson(minDoc, minJson);
-    
-    prefs.begin("rq", false);
-    uint32_t head = prefs.getUInt("head", 0);
-    uint32_t tail = prefs.getUInt("tail", 0);
-    String key = "r" + String(head % QSIZE);
-    prefs.putString(key.c_str(), minJson);
-    head++;
-    if (head - tail > QSIZE) tail++;
-    prefs.putUInt("head", head);
-    prefs.putUInt("tail", tail);
+  if (foundIdx < 0) {
     prefs.end();
-    return;
-  }
-  
-  prefs.begin("rq", false);
-  uint32_t head = prefs.getUInt("head", 0);
-  uint32_t tail = prefs.getUInt("tail", 0);
-
-  String key = "r" + String(head % QSIZE);
-  prefs.putString(key.c_str(), json);
-
-  head++;
-  if (head - tail > QSIZE) tail++;
-
-  prefs.putUInt("head", head);
-  prefs.putUInt("tail", tail);
-  prefs.end();
-}
-
-bool qPeek(String& out) {
-  prefs.begin("rq", true);
-  uint32_t head = prefs.getUInt("head", 0);
-  uint32_t tail = prefs.getUInt("tail", 0);
-  if (head == tail) { prefs.end(); return false; }
-  String key = "r" + String(tail % QSIZE);
-  out = prefs.getString(key.c_str(), "");
-  prefs.end();
-  return out.length() > 0;
-}
-
-void qPop() {
-  prefs.begin("rq", false);
-  uint32_t head = prefs.getUInt("head", 0);
-  uint32_t tail = prefs.getUInt("tail", 0);
-  if (head != tail) tail++;
-  prefs.putUInt("tail", tail);
-  prefs.end();
-}
-
-// ========================= HTTP FUNCTIONS =========================
-// Use secure client for HTTPS
-WiFiClientSecure secureClient;
-
-bool httpPostJson(const char* path, const String& body, String& response) {
-  // Use isOnline as single source of truth
-  if (!isOnline) return false;
-  if (!isCloudEnabled()) return false;
-
-  HTTPClient http;
-  
-  // Check if using HTTPS
-  String url = endpoint(path);
-  if (url.startsWith("https://")) {
-    secureClient.setInsecure();  // Skip certificate validation for simplicity
-    http.begin(secureClient, url);
-  } else {
-    http.begin(url);
-  }
-  
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("x-device-id", String(DEVICE_ID));
-  http.addHeader("x-api-key", String(API_KEY));
-  
-  int code = http.POST((uint8_t*)body.c_str(), body.length());
-  
-  if (code >= 200 && code < 300) {
-    response = http.getString();
-    http.end();
-    return true;
-  }
-  
-  http.end();
-  return false;
-}
-
-bool httpGetJson(const char* path, String& response) {
-  // Use isOnline as single source of truth
-  if (!isOnline) return false;
-  if (!isCloudEnabled()) return false;
-
-  HTTPClient http;
-  
-  String url = endpoint(path);
-  if (url.startsWith("https://")) {
-    secureClient.setInsecure();
-    http.begin(secureClient, url);
-  } else {
-    http.begin(url);
-  }
-  
-  http.addHeader("x-device-id", String(DEVICE_ID));
-  http.addHeader("x-api-key", String(API_KEY));
-  
-  int code = http.GET();
-  
-  if (code >= 200 && code < 300) {
-    response = http.getString();
-    http.end();
-    return true;
-  }
-  
-  http.end();
-  return false;
-}
-
-// ========================= DASHBOARD API CALLS =========================
-
-/**
- * Verify operator PIN - tries online first, then offline fallback
- * POST /api/device/verify-pin
- * Body: { "pin": "1234" }
- * Returns: { "ok": true, "operator": { "id", "name", "role" } }
- */
-bool verifyOperatorPinOnline(const String& pin) {
-  StaticJsonDocument<256> reqDoc;
-  reqDoc["pin"] = pin;
-  
-  String body;
-  serializeJson(reqDoc, body);
-  
-  String response;
-  if (!httpPostJson("/api/device/verify-pin", body, response)) {
-    return false;  // Network failed, will try offline
-  }
-  
-  StaticJsonDocument<512> resDoc;
-  DeserializationError err = deserializeJson(resDoc, response);
-  if (err) {
     return false;
   }
-  
-  bool ok = resDoc["ok"] | false;
-  if (!ok) {
-    lastError = resDoc["error"] | "Invalid PIN";
-    return false;
+  // Shift all users down
+  for (int i = foundIdx; i < count - 1; i++) {
+    prefs.putString(("c" + String(i)).c_str(), prefs.getString(("c" + String(i+1)).c_str(), ""));
+    prefs.putString(("p" + String(i)).c_str(), prefs.getString(("p" + String(i+1)).c_str(), ""));
+    prefs.putInt(("r" + String(i)).c_str(), prefs.getInt(("r" + String(i+1)).c_str(), 0));
   }
+  prefs.putInt("count", count - 1);
+  prefs.end();
   
-  // Extract operator info
-  session.operatorId = resDoc["operator"]["id"].as<String>();
-  session.operatorName = resDoc["operator"]["name"].as<String>();
-  session.operatorRole = resDoc["operator"]["role"].as<String>();
-  session.loggedIn = true;
-  
-  // Cache this operator for offline use (PIN will be hashed)
-  cacheOperator(pin, session.operatorName, session.operatorId, session.operatorRole);
+  // Sync deletion to dashboard
+  syncUserToDashboard(code, "", deletedRole, true);
   
   return true;
 }
 
-/**
- * Main PIN verification - handles online/offline modes
- */
-bool verifyOperatorPin(const String& pin) {
-  // Update online status before verification
-  updateOnlineStatus();
-  
-  // Try online verification first if online
-  if (isOnline && isCloudEnabled()) {
-    if (verifyOperatorPinOnline(pin)) {
+bool verifyUser(const String& code, const String& pin, Role& outRole) {
+  // Check admin first
+  if (code == ADMIN_CODE && pin == ADMIN_PIN) {
+    outRole = ADMIN;
+    return true;
+  }
+  // Check stored users
+  prefs.begin("users", true);
+  int count = prefs.getInt("count", 0);
+  for (int i = 0; i < count; i++) {
+    String storedCode = prefs.getString(("c" + String(i)).c_str(), "");
+    String storedPin = prefs.getString(("p" + String(i)).c_str(), "");
+    if (storedCode == code && storedPin == pin) {
+      outRole = (Role)prefs.getInt(("r" + String(i)).c_str(), 0);
+      prefs.end();
       return true;
     }
-    // If online but verification failed with "Invalid PIN", don't try offline
-    if (lastError == "Invalid PIN") {
-      return false;
-    }
-    // Network error - fall through to offline
   }
-  
-  // Offline verification using hashed PINs
-  if (verifyPinOffline(pin)) {
-    lastError = "";  // Clear any previous error
-    return true;
-  }
-  
-  lastError = "Invalid PIN";
+  prefs.end();
   return false;
 }
 
-/**
- * Fetch current pricing from dashboard
- * GET /api/device/config
- * Returns: { "ok": true, "price": { "pricePerLiter", "costPerLiter", "currency" } }
- */
-bool fetchPriceFromDashboard() {
-  // Only fetch if online (don't call when offline)
-  if (!isOnline) {
-    Serial.println("[INFO] Offline - using cached price");
-    return false;
+String getUserAtIndex(int idx, Role& outRole) {
+  prefs.begin("users", true);
+  int count = prefs.getInt("count", 0);
+  if (idx < 0 || idx >= count) {
+    prefs.end();
+    return "";
   }
-  
-  String response;
-  if (!httpGetJson("/api/device/config", response)) {
-    Serial.println("[WARN] Failed to fetch price from dashboard");
-    return false;
-  }
-  
-  StaticJsonDocument<512> doc;
-  DeserializationError err = deserializeJson(doc, response);
-  if (err) {
-    Serial.println("[ERROR] Failed to parse price response");
-    return false;
-  }
-  
-  bool ok = doc["ok"] | false;
-  if (!ok) {
-    Serial.println("[WARN] Dashboard returned error for config");
-    return false;
-  }
-  
-  price.sell = doc["price"]["pricePerLiter"] | price.sell;
-  price.cost = doc["price"]["costPerLiter"] | price.cost;
-  
-  String cur = doc["price"]["currency"] | "ZMW";
-  memset(price.currency, 0, sizeof(price.currency));
-  cur.toCharArray(price.currency, sizeof(price.currency));
-  
-  // Save to NVS as fallback for offline mode
-  savePricing();
-  
-  Serial.printf("[INFO] Price updated: %.2f %s/L\n", price.sell, price.currency);
-  return true;
+  String code = prefs.getString(("c" + String(idx)).c_str(), "");
+  outRole = (Role)prefs.getInt(("r" + String(idx)).c_str(), 0);
+  prefs.end();
+  return code;
 }
 
-/**
- * Send telemetry to dashboard
- * POST /api/ingest/telemetry
- */
-void sendTelemetry() {
-  // Only send if online
-  if (!isOnline) return;
-  
-  // Reset watchdog before network operation
-  feedWatchdog();
-  
-  StaticJsonDocument<768> doc;
-  doc["deviceId"] = String(DEVICE_ID);
-  doc["siteName"] = String(SITE_NAME);
-  doc["ts"] = (uint32_t)(unixNow() ? unixNow() : (millis()/1000));
+/* ================= LIVE DISPENSE DISPLAY ================= */
+void updateDispenseDisplay() {
+  static unsigned long lastDispUpdateMs = 0;
+  const unsigned long DISP_UPDATE_INTERVAL_MS = 250; // 200–300 ms window
 
-  // Required fields for dashboard schema (tank monitoring).
-  // This dispenser firmware doesn't have a tank sensor, so we send safe defaults.
-  doc["oilPercent"] = 100.0;
-  doc["oilLiters"] = 0.0;
-  doc["distanceCm"] = 0.0;
-  
-  // Safety status with tamper and anomaly detection
-  String safetyStatus = "IDLE";
-  if (tamperActive) {
-    safetyStatus = "TAMPER_DETECTED";
-  } else if (flowAnomalyDetected) {
-    safetyStatus = "ANOMALY_" + flowAnomalyType;
-  } else if (pumpOn()) {
-    safetyStatus = "DISPENSING";
-  }
-  doc["safetyStatus"] = safetyStatus;
-  doc["uptimeSec"] = (uint32_t)(millis() / 1000);
+  unsigned long now = millis();
+  if (now - lastDispUpdateMs < DISP_UPDATE_INTERVAL_MS) return;
+  lastDispUpdateMs = now;
 
-  // Dispenser fields
-  doc["flowLpm"] = flowLpm;
-  doc["litersTotal"] = litersTotal;
-  doc["pumpState"] = pumpOn();
+  int ml = (int)(dispensedLiters * 1000.0f);
+  String line1 = "DISPENSING";
+  while (line1.length() < 16) line1 += ' ';
 
-  int rssi = WiFi.RSSI();
-  if (rssi < -100) rssi = -100;
-  if (rssi > 0) rssi = 0;
-  doc["wifiRssi"] = rssi;
-  
-  // Industrial compliance flags
-  JsonObject compliance = doc.createNestedObject("compliance");
-  compliance["zabs"] = true;
-  compliance["zesco"] = true;
-  compliance["emcSafe"] = true;
-  compliance["brownoutProtected"] = true;
-  compliance["watchdogEnabled"] = true;
-  compliance["tamperDetectionActive"] = !tamperActive;
-  
-  // Watchdog status
-  if (watchdogResetDetected) {
-    doc["lastResetReason"] = lastResetReason;
-    doc["watchdogResetTime"] = watchdogResetTime;
-  }
+  String line2 = String(ml) + " ml";
+  while (line2.length() < 16) line2 += ' ';
 
-  String body;
-  serializeJson(doc, body);
-  String response;
-  
-  if (!httpPostJson("/api/ingest/telemetry", body, response)) {
-    // Log telemetry failure
-    Serial.println("[WARN] Telemetry send failed");
-  }
-  
-  // Reset watchdog after network operation
-  feedWatchdog();
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
+  lcd.setCursor(0, 1);
+  lcd.print(line2);
 }
 
-/**
- * Generate unique session ID for this transaction
- */
-String sessionId() {
-  return String(DEVICE_ID) + "-" + String(dispenseStartMs);
-}
-
-/**
- * Upload receipt to dashboard or queue for retry
- * POST /api/ingest/receipt
- */
-void uploadReceiptOrQueue(const char* status, const String& err) {
-  uint32_t endU = unixNow();
-  uint32_t startU = dispenseStartUnix ? dispenseStartUnix : (dispenseStartMs/1000);
-  uint32_t endUnix = endU ? endU : (millis()/1000);
-  uint32_t durSec = (millis() - dispenseStartMs) / 1000;
-  float totalAmount = dispensedLiters * price.sell;
-  float profitAmount = dispensedLiters * (price.sell - price.cost);
-
-  // Generate audit checksum for anti-fraud
-  String auditChecksum = generateAuditChecksum(
-    String(DEVICE_ID),
-    session.operatorId,
-    targetLiters,
-    dispensedLiters,
-    price.sell,
-    startU,
-    endUnix
-  );
-
-  StaticJsonDocument<1280> doc;
-  doc["sessionId"] = sessionId();
-  doc["deviceId"] = String(DEVICE_ID);
-  doc["siteName"] = String(SITE_NAME);
-  doc["operatorId"] = session.operatorId;  // Send operator ID directly
-  doc["operatorName"] = session.operatorName;
-  doc["targetLiters"] = targetLiters;
-  doc["dispensedLiters"] = dispensedLiters;
-  doc["pricePerLiter"] = price.sell;
-  doc["costPerLiter"] = price.cost;
-  doc["totalAmount"] = totalAmount;
-  doc["profitAmount"] = profitAmount;
-  doc["currency"] = String(price.currency);
-  doc["durationSec"] = (int)durSec;
-  doc["status"] = status;
-  if (err.length()) doc["errorMessage"] = err;
-  doc["startedAtUnix"] = startU;
-  doc["endedAtUnix"] = endUnix;
-  doc["isOffline"] = !isOnline;
-  
-  // Anti-fraud audit checksum
-  doc["auditChecksum"] = auditChecksum;
-  
-  // Flow anomaly data (if detected)
-  if (flowAnomalyDetected) {
-    doc["flowAnomaly"] = flowAnomalyType;
-  }
-  
-  // Tamper status
-  doc["tamperDetected"] = tamperActive;
-
-  String body;
-  serializeJson(doc, body);
-  
-  // Reset watchdog before network operation
-  feedWatchdog();
-  
-  String response;
-  if (!httpPostJson("/api/ingest/receipt", body, response)) {
-    qPush(body);  // Queue for retry if network fails
-    Serial.println("[INFO] Receipt queued for retry");
-  } else {
-    Serial.println("[INFO] Receipt uploaded successfully");
-    Serial.printf("[AUDIT] Checksum: %s\n", auditChecksum.c_str());
-  }
-  
-  feedWatchdog();
-}
-
-/**
- * Retry queued receipts
- */
-void retryQueuedReceipts() {
-  // Only retry if online
-  if (!isOnline) return;
-  
-  String item;
-  if (!qPeek(item)) return;
-  
-  String response;
-  if (httpPostJson("/api/ingest/receipt", item, response)) {
-    qPop();
-    Serial.println("[INFO] Queued receipt uploaded");
-  }
-}
-
-// ========================= FLOW UPDATE =========================
+/* ================= FLOW ================= */
 void updateFlow() {
-  uint32_t now = millis();
-  if (now - lastFlowMs < 500) return;
-
+  if (millis() - lastFlowMs < 300) return;
   uint32_t p;
-  noInterrupts();
-  p = flowPulses;
-  interrupts();
-
-  uint32_t dp = p - lastPulseSnapshot;
-  lastPulseSnapshot = p;
-
-  float liters = (pulsesPerLiter > 0.1f) ? (dp / pulsesPerLiter) : 0.0f;
-
-  if (state == DISPENSING) dispensedLiters += liters;
-  litersTotal += liters;
-
-  float dtMin = (now - lastFlowMs) / 60000.0f;
-  flowLpm = (dtMin > 0) ? (liters / dtMin) : 0;
-
-  lastFlowMs = now;
-  
-  // Flow anomaly detection
-  detectFlowAnomalies();
-
-  // Dry-run protection: stop pump if no flow detected for 10 seconds
-  if (state == DISPENSING && pumpOn()) {
-    if (flowLpm < 0.01f) {
-      if (noFlowStartMs == 0) noFlowStartMs = now;
-      if (now - noFlowStartMs > 10000) {
-        safePumpSet(false);
-        lastError = "DRY RUN: no flow";
-        state = ERROR_STATE;
-        uploadReceiptOrQueue("ERROR", lastError);
-      }
-    } else {
-      noFlowStartMs = 0;
-    }
-  } else {
-    noFlowStartMs = 0;
-  }
-  
-  // Maximum pump runtime failsafe
-  if (state == DISPENSING && pumpOn()) {
-    if (now - dispenseStartMs > MAX_PUMP_RUNTIME_MS) {
-      safePumpSet(false);
-      lastError = "MAX RUNTIME EXCEEDED";
-      Serial.printf("[ERROR] Pump exceeded max runtime of %d ms\n", MAX_PUMP_RUNTIME_MS);
-      state = ERROR_STATE;
-      uploadReceiptOrQueue("ERROR", lastError);
-    }
-  }
+  noInterrupts(); p = flowPulses; interrupts();
+  uint32_t dp = p - lastPulse;
+  lastPulse = p;
+  if (state == ST_DISPENSING) dispensedLiters += dp / pulsesPerLiter;
+  lastFlowMs = millis();
 }
 
-// ========================= WIFI + TIME (NON-BLOCKING) =========================
-void connectWiFiNonBlocking() {
-  if (String(WIFI_SSID).length() == 0) {
-    lcdClear();
-    lcdPrintCenter(0, "No WiFi Config");
-    lcdPrintCenter(1, "OFFLINE MODE");
-    isOnline = false;
-    return;
-  }
-
-  lcdClear();
-  lcdPrintCenter(0, "Connecting WiFi");
-  lcdPrintCenter(1, WIFI_SSID);
-
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-
-  // Non-blocking wait with timeout - use yield() instead of delay()
-  uint32_t start = millis();
-  int dots = 0;
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-    yield();  // Non-blocking - allow ESP32 to handle background tasks
-    if (millis() - start > dots * 500) {
-      lcd.setCursor(dots % 16, 1);
-      lcd.print(".");
-      dots++;
-    }
-  }
-
-  // Update single source of truth
-  updateOnlineStatus();
-
-  lcdClear();
-  if (isOnline) {
-    lcdPrintCenter(0, "WiFi Connected!");
-    lcdPrint(0, 1, WiFi.localIP().toString());
-    
-    // Sync time via NTP (non-blocking after initial call)
-    configTime(0, 0, "pool.ntp.org", "time.google.com", "time.nist.gov");
-    
-    // Brief display
-    uint32_t showStart = millis();
-    while (millis() - showStart < 1500) yield();
-    
-    // Fetch current pricing from dashboard
-    lcdClear();
-    lcdPrintCenter(0, "Fetching price..");
-    if (fetchPriceFromDashboard()) {
-      char buf[17];
-      snprintf(buf, sizeof(buf), "%.2f %s/L", price.sell, price.currency);
-      lcdPrintCenter(1, buf);
-    } else {
-      lcdPrintCenter(1, "Using local");
-    }
-    showStart = millis();
-    while (millis() - showStart < 1000) yield();
-  } else {
-    lcdPrintCenter(0, "WiFi FAILED");
-    lcdPrintCenter(1, "OFFLINE MODE");
-    uint32_t showStart = millis();
-    while (millis() - showStart < 2000) yield();
-    
-    // Show offline price
-    lcdClear();
-    lcdPrintCenter(0, "Offline Price:");
-    char buf[17];
-    snprintf(buf, sizeof(buf), "%.2f %s/L", price.sell, price.currency);
-    lcdPrintCenter(1, buf);
-    showStart = millis();
-    while (millis() - showStart < 1500) yield();
-  }
-}
-
-// ========================= SETUP =========================
+/* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
-  delay(100);
-  Serial.println("\n[ESP32] Oil Dispenser Starting...");
-  Serial.println("[ESP32] Online + Offline Mode Enabled");
-  Serial.println("[ESP32] Production-Critical Firmware (Patched + Safety)");
-  
-  // Check reset reason FIRST (before any other initialization)
-  lastResetReason = getResetReason();
-  Serial.printf("[SYSTEM] Reset reason: %s\n", lastResetReason.c_str());
-  
-  if (lastResetReason.indexOf("WATCHDOG") >= 0 || lastResetReason.indexOf("BROWNOUT") >= 0) {
-    watchdogResetDetected = true;
-    watchdogResetTime = millis();
-    Serial.println("[WARNING] Watchdog or brownout reset detected - entering safe mode");
-  }
+  Serial.println("[BOOT] PIMISHA Oil Dispenser");
 
-  // CRITICAL: All GPIO outputs LOW on boot (electrical safety)
   pinMode(PIN_PUMP, OUTPUT);
-  digitalWrite(PIN_PUMP, LOW);  // Pump OFF regardless of active high/low
-  delay(50);
-  pumpSet(false);  // Then set proper state
-  
-  // Initialize hardware watchdog (8 second timeout)
-  initWatchdog();
-  feedWatchdog();
+  relayOff();
 
-  // Initialize flow sensor interrupt
-  pinMode(PIN_FLOW, INPUT_PULLUP);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_YELLOW, OUTPUT);
+  ledsIdle();
+
+  pinMode(PIN_FLOW, INPUT);
   attachInterrupt(digitalPinToInterrupt(PIN_FLOW), onFlowPulse, RISING);
-  
-  // Initialize flow timing
-  lastFlowMs = millis();
-  noInterrupts();
-  flowPulses = 0;
-  interrupts();
-  lastPulseSnapshot = 0;
-  
-  feedWatchdog();
-  
-  // Initialize tamper detection pin only if enabled (GPIO 34 is INPUT_ONLY, needs external pull-up)
-  if (ENABLE_TAMPER_DETECTION) {
-    pinMode(PIN_TAMPER, INPUT);
-    Serial.println("[SECURITY] Tamper detection ENABLED - GPIO 34 requires external 10kΩ pull-up");
-  } else {
-    Serial.println("[SECURITY] Tamper detection DISABLED for testing");
-  }
-  
-  feedWatchdog();
 
-  // Initialize I2C LCD
-  Wire.begin(21, 22);  // SDA=21, SCL=22 (ESP32 default)
+  // Optional tamper switch (normally-closed to GND)
+  pinMode(PIN_TAMPER, INPUT_PULLUP);
+
+  Wire.begin(21, 22);
   lcd.init();
   lcd.backlight();
-  lcd.clear();
-  lcdPrintCenter(0, "OIL DISPENSER");
-  lcdPrintCenter(1, "Starting...");
-  
-  uint32_t showStart = millis();
-  while (millis() - showStart < 1000) {
-    feedWatchdog();
-    yield();
+
+  // Let Keypad.h fully manage keypad GPIO modes
+  keypad.setDebounceTime(80);   // ms
+  keypad.setHoldTime(700);      // ms
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  // Load calibrated pulses-per-liter if available
+  prefs.begin("calib", true);
+  float storedPpl = prefs.getFloat("pulsesPerL", 0.0f);
+  prefs.end();
+  if (storedPpl > 0.0f) {
+    pulsesPerLiter = storedPpl;
+    Serial.printf("[CALIB] Using stored pulsesPerLiter=%.2f\n", pulsesPerLiter);
+  } else {
+    Serial.printf("[CALIB] Using default pulsesPerLiter=%.2f\n", pulsesPerLiter);
   }
-  
-  feedWatchdog();
 
-  // Show device info
-  lcdClear();
-  lcdPrint(0, 0, "ID:");
-  lcdPrint(3, 0, DEVICE_ID);
-  lcdPrint(0, 1, SITE_NAME);
-  showStart = millis();
-  while (millis() - showStart < 1500) {
-    feedWatchdog();
-    yield();
-  }
-  
-  feedWatchdog();
-
-  // Load settings from NVS (includes cached prices and litersTotal)
-  loadSettings();
-  
-  // Initialize offline operators (fallback PINs with hashes)
-  initOfflineOperators();
-  
-  feedWatchdog();
-
-  // Connect WiFi (non-blocking)
-  connectWiFiNonBlocking();
-  
-  feedWatchdog();
-
-  // Clear session
-  clearSession();
-  
-  lcd.noCursor();
-  
-  feedWatchdog();
-
-  Serial.println("[ESP32] Ready");
-  Serial.printf("[ESP32] Price: %.2f %s/L\n", price.sell, price.currency);
-  Serial.printf("[ESP32] Mode: %s\n", isOnline ? "ONLINE" : "OFFLINE");
-  Serial.printf("[ESP32] Lifetime liters: %.2f\n", litersTotal);
-  Serial.println("[SAFETY] Watchdog active, tamper detection enabled");
-  Serial.println("[COMPLIANCE] ZABS/ZESCO/EMC safe, brownout protected");
+  // Show that the system is powered and ready
+  lcdShow("SYSTEM RUNNING", "ENTER CODE");
 }
 
-// ========================= MAIN LOOP =========================
-uint32_t holdAStart = 0;
-bool holdingA = false;
-uint32_t lastWifiCheckMs = 0;
-static const uint32_t WIFI_CHECK_MS = 60000;  // Check WiFi every 60 seconds
+/* ================= LOOP ================= */
+unsigned long lastKeyTime = 0;
+char lastKey = 0;
 
 void loop() {
-  // Reset watchdog at start of every loop iteration
-  feedWatchdog();
-  
-  // Check for tamper (cabinet open / wire cut)
-  checkTamper();
-  
-  // Update flow meter
+  isOnline = (WiFi.status() == WL_CONNECTED);
+  static unsigned long lastQ = 0;
+  static unsigned long lastUserSync = 0;
+  if (isOnline && millis() - lastQ > 5000) { resendQueue(); lastQ = millis(); }
+  if (isOnline && millis() - lastUserSync > 7000) { resendUserSyncQueue(); lastUserSync = millis(); }
   updateFlow();
-  
-  // Periodic litersTotal persistence
-  if (millis() - lastLitersSaveMs > LITERS_SAVE_MS) {
-    lastLitersSaveMs = millis();
-    saveLitersTotal();
+  sendHeartbeat();  // Send heartbeat to dashboard
+  fetchDeviceConfig();  // Refresh price and site name from dashboard
+  checkTamper();   // Tamper detection
+
+  // SAFETY: Pump OFF unless dispensing
+  if (state != ST_DISPENSING) {
+    relayOff();
+    ledsIdle();
   }
-  
-  // Periodic WiFi status update and reconnection (non-blocking, when idle)
-  if (state == IDLE && millis() - lastWifiCheckMs > WIFI_CHECK_MS) {
-    lastWifiCheckMs = millis();
-    bool wasOnline = isOnline;
-    updateOnlineStatus();  // Single source of truth update
+
+  // Scrolling welcome in menu state
+  if (state == ST_MENU) {
+    scrollWelcome();
+    lcd.setCursor(0, 1);
+    lcd.print("ENTER SALE  C=OUT");
+  }
+
+  // Dispensing display update (live volume and cost)
+  if (state == ST_DISPENSING) {
+    updateDispenseDisplay();
     
-    // Try to reconnect if was offline (non-blocking)
-    if (!isOnline && String(WIFI_SSID).length() > 0) {
-      WiFi.reconnect();
-      // Don't block - check result on next iteration
-      yield();
-      updateOnlineStatus();
-      
-      // If just came online, fetch latest price
-      if (isOnline && !wasOnline) {
-        feedWatchdog();
-        fetchPriceFromDashboard();
-        Serial.println("[ESP32] Reconnected - fetched latest price");
-      }
+    // Auto-stop when target reached (normal dispensing only)
+    if (!calibrationMode && targetLiters > 0 && dispensedLiters >= (targetLiters - STOP_MARGIN_LITERS)) {
+      relayOff();
+      ledsIdle();
+      float mlDone = dispensedLiters * 1000;
+      float paid = round2(mlDone * sessionPricePerMl);
+      float targetMl = targetLiters * 1000.0f;
+      sendReceipt(mlDone, paid, targetMl, "DONE");  // Send to dashboard
+      state = ST_LOGIN_CODE;
+      inputBuf = "";
+      amountZmw = 0;
+      calibrationMode = false;
+      lcdShow("DONE", String((int)mlDone) + " ml");
+      delay(2000);
+      lcdShow("SYSTEM RUNNING", "ENTER CODE");
     }
   }
 
-  // Periodic telemetry (every 10 seconds, only if online)
-  if (millis() - lastTelemetryMs > TELEMETRY_MS) {
-    lastTelemetryMs = millis();
-    updateOnlineStatus();  // Refresh status before telemetry
-    sendTelemetry();  // Will check isOnline internally and reset watchdog
-  }
+  char k = keypad.getKey();
+  if (k == NO_KEY) return;
 
-  // Retry queued receipts (when online)
-  if (millis() - lastReceiptRetryMs > RETRY_MS) {
-    lastReceiptRetryMs = millis();
-    updateOnlineStatus();
-    retryQueuedReceipts();  // Will check isOnline internally
+  // Validate key is a real keypad character (prevent ghost keys)
+  bool validKey = false;
+  const char validKeys[] = "0123456789ABCD*#";
+  for (int i = 0; i < 16; i++) {
+    if (k == validKeys[i]) { validKey = true; break; }
   }
-
-  // Scroll timer for long text
-  if (millis() - lastScrollMs > SCROLL_MS) {
-    lastScrollMs = millis();
-    scrollPos++;
-  }
-
-  // UI refresh
-  if (millis() - lastUiMs > UI_MS) {
-    lastUiMs = millis();
-    switch (state) {
-      case IDLE:           uiIdle(); break;
-      case ENTER_PIN:      uiEnterPin(); break;
-      case VERIFYING_PIN:  uiVerifyingPin(); break;
-      case ENTER_LITERS:   uiEnterLiters(); break;
-      case CONFIRM_READY:  uiConfirmReady(); break;
-      case DISPENSING:     
-        uiDispense(); 
-        feedWatchdog();  // Extra watchdog reset during dispensing
-        break;
-      case PAUSED:         uiPaused(); break;
-      case COMPLETING:     uiCompleting(); break;
-      case RECEIPT:        uiReceipt(); break;
-      case ERROR_STATE:    uiError(); break;
-      case ADMIN:
-        if (am == AMENU) uiAdminMenu();
-        else if (am == A_SELL) uiAdminInput("SELL PRICE:");
-        else if (am == A_COST) uiAdminInput("COST PRICE:");
-        else if (am == A_CAL)  uiAdminInput("PULSES/L:");
-        break;
-    }
-  }
-
-  // Keypad handling (blocked if tamper locked)
-  char k = 0;
-  if (!tamperLocked) {
-    k = keypad.getKey();
-  }
+  if (!validKey) return;  // Ignore invalid/ghost keys
   
-  if (k) {
-    lcd.noCursor();  // Hide cursor on any key press
-    
-    // Admin hold detection: pressing A in IDLE starts hold timer
-    if (state == IDLE && k == 'A') {
-      if (!holdingA) {
-        holdingA = true;
-        holdAStart = millis();
-      }
-    } else if (k != 'A') {
-      holdingA = false;
-    }
+  // Prevent same key repeating too fast (ghost protection)
+  if (k == lastKey && (millis() - lastKeyTime) < 80) return;
+  lastKey = k;
+  lastKeyTime = millis();
 
-    // ========== IDLE STATE ==========
-    if (state == IDLE) {
-      if (k == 'A') {
-        // Short press A: Start login (handled after hold check)
-      }
-    }
+  Serial.printf("[KEY] %c\\n", k);
 
-    // ========== ENTER PIN STATE ==========
-    else if (state == ENTER_PIN) {
-      if (k >= '0' && k <= '9') {
-        if (pinBuf.length() < 8) pinBuf += k;
-      } else if (k == '*') {
-        // Cancel, return to IDLE
-        pendingAdminCheck = false;
-        clearSession();
-        state = IDLE;
-      } else if (k == '#') {
-        // Confirm PIN, verify with dashboard
-        if (pinBuf.length() < 4) {
-          lastError = "PIN too short";
-          pendingAdminCheck = false;
-          state = ERROR_STATE;
-        } else {
-          state = VERIFYING_PIN;
-          uiVerifyingPin();
-          
-          if (verifyOperatorPin(pinBuf)) {
-            // Success! Check if admin access was requested
-            if (pendingAdminCheck) {
-              pendingAdminCheck = false;
-              // Check if operator has admin/supervisor role ONLY
-              // No backdoor based on operatorId
-              if (isAdminRole(session.operatorRole)) {
-                // Admin access granted based on role
-                state = ADMIN;
-                am = AMENU;
-                adminBuf = "";
-                Serial.printf("[INFO] Admin access granted to %s (role: %s)\n", 
-                              session.operatorName.c_str(), session.operatorRole.c_str());
-              } else {
-                // Not an admin - access denied
-                lastError = "Admin access denied";
-                scrollPos = 0;
-                state = ERROR_STATE;
-                Serial.printf("[WARN] Admin access denied for %s (role: %s)\n",
-                              session.operatorName.c_str(), session.operatorRole.c_str());
-              }
-            } else {
-              // Normal login - fetch price only if online
-              updateOnlineStatus();
-              if (isOnline) {
-                fetchPriceFromDashboard();
-              }
-              litersBuf = "";
-              scrollPos = 0;
-              state = ENTER_LITERS;
-            }
-          } else {
-            // Failed
-            pendingAdminCheck = false;
-            scrollPos = 0;
-            state = ERROR_STATE;
+  // * = EMERGENCY STOP (only when dispensing)
+  if (k == '*' && state == ST_DISPENSING) {
+    relayOff();
+    ledsError();
+    if (calibrationMode) {
+      // Abort calibration without sending a receipt
+      calibrationMode = false;
+      dispensedLiters = 0;
+      lcdShow("CAL ABORTED", "* pressed");
+      delay(1500);
+      state = ST_ADMIN_MENU;
+      lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+    } else {
+      if (dispensedLiters > 0) {
+        float mlDone = dispensedLiters * 1000;
+        float paid = round2(mlDone * sessionPricePerMl);
+        float targetMl = (targetLiters > 0 && targetLiters < 900.0f) ? targetLiters * 1000.0f : 0.0f;
+        sendReceipt(mlDone, paid, targetMl, "ERROR");
+        state = ST_LOGIN_CODE;
+        inputBuf = "";
+        amountZmw = 0;
+        dispensedLiters = 0;
+        lcdShow("E-STOP", String((int)mlDone) + "ml K" + String((int)paid));
+      } else {
+        state = ST_LOGIN_CODE;
+        inputBuf = "";
+        amountZmw = 0;
+        dispensedLiters = 0;
+        lcdShow("!! STOPPED !!", "* pressed");
+      }
+      delay(1500);
+      lcdShow("SYSTEM RUNNING", "ENTER CODE");
+    }
+    return;
+  }
+
+  switch (state) {
+    case ST_LOGIN_CODE:
+      if (isdigit(k)) { 
+        inputBuf += k; 
+        lcdShow("CODE", inputBuf); 
+      }
+      else if (k == '#' && inputBuf.length() > 0) { 
+        loginCode = inputBuf; 
+        inputBuf = ""; 
+        state = ST_LOGIN_PIN; 
+        lcdShow("PIN", ""); 
+      }
+      break;
+
+    case ST_LOGIN_PIN:
+      if (isdigit(k)) {
+        inputBuf += k;
+        String mask = "";
+        for (size_t i = 0; i < inputBuf.length(); i++) mask += '*';
+        lcdShow("PIN", mask);
+      } else if (k == '#' && inputBuf.length() > 0) {
+        // Verify user credentials
+        Role verifiedRole;
+        if (verifyUser(loginCode, inputBuf, verifiedRole)) {
+          // If tamper is latched, only ADMIN can clear and proceed
+          if (tamperLatched && verifiedRole != ADMIN) {
+            lcdShow("TAMPER LOCK", "ADMIN ONLY");
+            delay(1500);
+            inputBuf = "";
+            loginCode = "";
+            lcdShow("LOGIN", "ENTER CODE");
+            state = ST_LOGIN_CODE;
+            break;
           }
-        }
-      }
-    }
 
-    // ========== ENTER LITERS STATE ==========
-    else if (state == ENTER_LITERS) {
-      if (k >= '0' && k <= '9') {
-        if (litersBuf.length() < 5) litersBuf += k;
-      } else if (k == '*') {
-        // Cancel, logout operator
-        clearSession();
-        state = IDLE;
-      } else if (k == '#') {
-        // Confirm liters
-        targetLiters = litersBuf.toFloat();
-        if (targetLiters <= 0) {
-          lastError = "Invalid liters";
-          scrollPos = 0;
-          state = ERROR_STATE;
-        } else if (price.sell <= 0) {
-          lastError = "No price set";
-          scrollPos = 0;
-          state = ERROR_STATE;
+          // Successful login (either normal or ADMIN clearing tamper)
+          lastLoginPin = inputBuf;  // keep raw PIN in RAM for receipt mapping
+          currentRole = verifiedRole;
+          inputBuf = "";
+
+          if (tamperLatched && verifiedRole == ADMIN) {
+            // ADMIN acknowledges and clears tamper latch
+            tamperLatched = false;
+            lcdShow("TAMPER CLEARED", "ADMIN OK");
+            delay(1500);
+          }
+
+          if (verifiedRole == ADMIN) {
+            state = ST_ADMIN_MENU;
+            lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+          } else {
+            amountZmw = 0;
+            state = ST_AMOUNT;
+            lcdShow("ENTER AMOUNT", "K 0");
+          }
         } else {
-          state = CONFIRM_READY;
+          lcdShow("INVALID!", "TRY AGAIN");
+          delay(1500);
+          inputBuf = "";
+          state = ST_LOGIN_CODE;
+          lcdShow("LOGIN", "ENTER CODE");
         }
       }
-    }
+      else if (k == 'C') {
+        // Cancel back to code entry
+        inputBuf = "";
+        state = ST_LOGIN_CODE;
+        lcdShow("SYSTEM RUNNING", "ENTER CODE");
+      }
+      break;
 
-    // ========== CONFIRM READY STATE ==========
-    else if (state == CONFIRM_READY) {
-      if (k == '*') {
-        // Cancel, logout operator
-        clearSession();
-        state = IDLE;
-      } else if (k == 'D') {
-        // Start dispensing with safety checks
-        if (canStartPump()) {
-          dispensedLiters = 0.0f;
-          noFlowStartMs = 0;
-          flowAnomalyDetected = false;
-          flowAnomalyType = "";
-          lastFlowLpm = 0.0f;
-          flowDropStartMs = 0;
-          dispenseStartMs = millis();
-          dispenseStartUnix = unixNow();
-          safePumpSet(true);
-          state = DISPENSING;
+    case ST_MENU:
+      if (k == 'A') { 
+        amountZmw = 0; 
+        state = ST_AMOUNT; 
+        lcdShow("ENTER AMOUNT", "K 0"); 
+      }
+      else if (k == 'C') {
+        // C = Cancel/Logout
+        state = ST_LOGIN_CODE;
+        inputBuf = "";
+        lcdShow("SYSTEM RUNNING", "ENTER CODE");
+      }
+      break;
+
+    case ST_AMOUNT:
+      if (isdigit(k)) {
+        amountZmw = amountZmw * 10 + (k - '0');
+        lcdShow("ENTER AMOUNT", "K " + String((int)amountZmw));
+      } 
+      else if (k == '#' && amountZmw > 0) {
+        if (pricePerMl <= 0.0f) {
+          lcdShow("PRICE ERROR", "SET PRICE");
+          delay(1500);
+          amountZmw = 0;
+          state = ST_LOGIN_CODE;
+          inputBuf = "";
+          lcdShow("SYSTEM RUNNING", "ENTER CODE");
         } else {
-          lastError = "Pump start blocked";
-          state = ERROR_STATE;
+          targetLiters = (amountZmw / pricePerMl) / 1000.0f;
+          state = ST_READY;
+          float ml = targetLiters * 1000;
+          lcdShow("CONFIRM", "K" + String((int)amountZmw) + "=" + String((int)ml) + "ml");
+          delay(800);
+          lcdShow("READY", "PRESS B");
         }
       }
-    }
-
-    // ========== DISPENSING STATE ==========
-    else if (state == DISPENSING) {
-      if (k == '*') {
-        // Emergency stop - freeze pulse count first
-        noInterrupts();
-        uint32_t finalPulses = flowPulses;
-        interrupts();
-        safePumpSet(false);
-        // Update final dispensed amount
-        uint32_t dp = finalPulses - lastPulseSnapshot;
-        lastPulseSnapshot = finalPulses;
-        if (pulsesPerLiter > 0.1f) {
-          dispensedLiters += dp / pulsesPerLiter;
-        }
-        state = PAUSED;
+      else if (k == 'C') {
+        // Cancel back to login
+        amountZmw = 0;
+        state = ST_LOGIN_CODE;
+        inputBuf = "";
+        lcdShow("SYSTEM RUNNING", "ENTER CODE");
       }
-    }
-
-    // ========== PAUSED STATE ==========
-    else if (state == PAUSED) {
-      if (k == '#') {
-        // Resume dispensing
-        safePumpSet(true);
-        state = DISPENSING;
-      } else if (k == '*') {
-        // Cancel sale completely
-        safePumpSet(false);
-        uploadReceiptOrQueue("CANCELED", "User canceled");
-        clearSession();
-        state = IDLE;
+      else if (k == '*') {
+        // Backspace
+        amountZmw = (int)(amountZmw / 10);
+        lcdShow("ENTER AMOUNT", "K " + String((int)amountZmw));
       }
-    }
+      break;
 
-    // ========== RECEIPT STATE ==========
-    else if (state == RECEIPT) {
-      if (k == '#') {
-        // Finish, auto-logout, return to IDLE
-        // Save litersTotal before clearing
-        saveLitersTotal();
-        clearSession();
-        state = IDLE;
+    case ST_READY:
+      if (k == 'B') {
+        dispensedLiters = 0;
+        flowPulses = 0;
+        lastPulse = 0;
+        // Lock price and session details at start of dispense
+        sessionPricePerMl = pricePerMl;
+        sessionTargetLiters = targetLiters;
+        sessionStartMs = millis();
+        sessionCounter++;
+        currentSessionId = String(DEVICE_ID) + "-" + String(sessionStartMs) + "-" + String(sessionCounter);
+        relayOn();
+        ledsDispensing();
+        state = ST_DISPENSING;
       }
-    }
-
-    // ========== ERROR STATE ==========
-    else if (state == ERROR_STATE) {
-      if (k == '#') {
-        // Clear error if not tamper (tamper requires admin)
-        if (!tamperActive) {
-          lastError = "";
-          flowAnomalyDetected = false;
-          flowAnomalyType = "";
-          clearSession();
-          state = IDLE;
-        }
+      else if (k == 'C') {
+        // Cancel back to amount entry (keep value)
+        amountZmw = 0;
+        state = ST_AMOUNT;
+        lcdShow("ENTER AMOUNT", "K 0");
       }
-    }
+      break;
 
-    // ========== ADMIN MODE ==========
-    if (state == ADMIN) {
-      if (am == AMENU) {
-        if (k == '*') {
-          state = IDLE;
-          am = AMENU;
-          adminBuf = "";
-        } else if (tamperActive && k == 'D') {
-          // Clear tamper (admin only)
-          tamperActive = false;
-          tamperLocked = false;
-          lastError = "";
-          Serial.println("[SECURITY] Tamper cleared by admin");
-          lcdClear();
-          lcdPrintCenter(0, "TAMPER CLEARED");
-          lcdPrintCenter(1, "System unlocked");
+    case ST_DISPENSING:
+      // D already handled above as emergency stop
+      if (calibrationMode) {
+        // In calibration, '#' finishes 1L run and saves pulsesPerLiter
+        if (k == '#') {
+          relayOff();
+          ledsIdle();
+          noInterrupts();
+          uint32_t pulses = flowPulses;
+          interrupts();
+          if (pulses > 0) {
+            pulsesPerLiter = (float)pulses;
+            prefs.begin("calib", false);
+            prefs.putFloat("pulsesPerL", pulsesPerLiter);
+            prefs.end();
+            lcdShow("CAL DONE", String((int)pulsesPerLiter) + " p/L");
+          } else {
+            lcdShow("CAL FAILED", "NO PULSES");
+          }
           delay(2000);
-          state = IDLE;
-          am = AMENU;
-        } else if (!tamperActive && k == 'A') {
-          am = A_SELL;
-          adminBuf = "";
-        } else if (!tamperActive && k == 'B') {
-          am = A_COST;
-          adminBuf = "";
-        } else if (!tamperActive && k == 'C') {
-          am = A_CAL;
-          adminBuf = "";
+          calibrationMode = false;
+          dispensedLiters = 0;
+          state = ST_ADMIN_MENU;
+          lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+        } else if (k == 'C') {
+          // Cancel calibration without saving
+          relayOff();
+          ledsIdle();
+          calibrationMode = false;
+          dispensedLiters = 0;
+          lcdShow("CAL CANCELLED", "");
+          delay(1500);
+          state = ST_ADMIN_MENU;
+          lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
         }
       } else {
-        if (k >= '0' && k <= '9') {
-          if (adminBuf.length() < 10) adminBuf += k;
-        } else if (k == '*') {
-          am = AMENU;
-          adminBuf = "";
-        } else if (k == '#') {
-          float v = adminBuf.toFloat();
-          if (am == A_SELL) {
-            if (v >= 0) price.sell = v;
-            savePricing();
-          }
-          if (am == A_COST) {
-            if (v >= 0) price.cost = v;
-            savePricing();
-          }
-          if (am == A_CAL) {
-            if (v > 1 && v < 1000000) {
-              pulsesPerLiter = v;
-              prefs.begin("flow", false);
-              prefs.putFloat("ppl", pulsesPerLiter);
-              prefs.end();
-            }
-          }
-          am = AMENU;
-          adminBuf = "";
+        // Normal dispensing: C = Cancel dispensing with partial receipt
+        if (k == 'C') {
+          relayOff();
+          ledsError();
+          float mlDone = dispensedLiters * 1000;
+          float paid = round2(mlDone * sessionPricePerMl);
+          float targetMl = (targetLiters > 0 && targetLiters < 900.0f) ? targetLiters * 1000.0f : 0.0f;
+          if (mlDone > 0) sendReceipt(mlDone, paid, targetMl, "CANCELED");  // Send partial receipt
+          lcdShow("CANCELLED", String((int)mlDone) + "ml K" + String((int)paid));
+          delay(1500);
+          state = ST_MENU;
+          scrollPos = 0;
+          amountZmw = 0;
         }
       }
-    }
-  }
+      break;
 
-  // Check for hold A -> admin mode OR short press A -> login
-  if (holdingA && state == IDLE) {
-    if (millis() - holdAStart > 3000) {
-      // Long hold (3s): enter admin - requires admin ROLE verification
-      holdingA = false;
-      holdAStart = 0;
-      // Set flag to check for admin after PIN verification
-      pendingAdminCheck = true;
-      pinBuf = "";
-      state = ENTER_PIN;
-    }
-  }
-  
-  // Short press A detection (key released)
-  if (!holdingA && holdAStart > 0 && state == IDLE) {
-    if (millis() - holdAStart >= 50 && millis() - holdAStart < 2000) {
-      // Short press: start login
-      pinBuf = "";
-      state = ENTER_PIN;
-    }
-    holdAStart = 0;
-  }
+    /* ================= ADMIN MENU STATES ================= */
+    case ST_ADMIN_MENU:
+      if (k == '1') {
+        // Add new user
+        newUserCode = "";
+        newUserPin = "";
+        state = ST_ADD_USER_CODE;
+        lcdShow("NEW USER CODE", "");
+      }
+      else if (k == '2') {
+        // Delete user
+        inputBuf = "";
+        state = ST_DELETE_USER;
+        lcdShow("DELETE USER", "ENTER CODE:");
+      }
+      else if (k == '3') {
+        // List users
+        listUserIdx = 0;
+        state = ST_LIST_USERS;
+        Role r;
+        String code = getUserAtIndex(0, r);
+        if (code.length() > 0) {
+          String roleStr = (r == SUPERVISOR) ? "SUP" : "OPR";
+          lcdShow("1:" + code, roleStr + " */# NAV C=BACK");
+        } else {
+          lcdShow("NO USERS", "C=BACK");
+        }
+      }
+      else if (k == '4') {
+        // Calibration menu (admin only)
+        calibrationMode = true;
+        dispensedLiters = 0;
+        flowPulses = 0;
+        lastPulse = 0;
+        state = ST_CALIBRATE;
+        lcdShow("CAL 1L READY", "B=START C=BACK");
+      }
+      else if (k == 'A') {
+        // Go to dispense menu
+        state = ST_MENU;
+        scrollPos = 0;
+      }
+      else if (k == 'C') {
+        // Logout
+        state = ST_LOGIN_CODE;
+        inputBuf = "";
+        lcdShow("SYSTEM RUNNING", "ENTER CODE");
+      }
+      break;
 
-  // Auto-stop when target liters reached
-  if (state == DISPENSING) {
-    feedWatchdog();  // Extra feed during dispensing
-    
-    if (dispensedLiters >= targetLiters) {
-      // Freeze pulse count before stopping pump
-      noInterrupts();
-      uint32_t finalPulses = flowPulses;
-      interrupts();
-      safePumpSet(false);
-      
-      // Calculate final dispensed amount
-      uint32_t dp = finalPulses - lastPulseSnapshot;
-      lastPulseSnapshot = finalPulses;
-      if (pulsesPerLiter > 0.1f) {
-        float additionalLiters = dp / pulsesPerLiter;
-        dispensedLiters += additionalLiters;
-        litersTotal += additionalLiters;
+    case ST_ADD_USER_CODE:
+      if (isdigit(k)) {
+        newUserCode += k;
+        lcdShow("NEW CODE", newUserCode);
       }
-      
-      // Cap at target if slightly over
-      if (dispensedLiters > targetLiters * 1.05f) {
-        dispensedLiters = targetLiters;  // Cap overshoot
+      else if (k == '#' && newUserCode.length() >= 2) {
+        state = ST_ADD_USER_PIN;
+        lcdShow("NEW PIN", "");
       }
-      
-      // Save litersTotal immediately after dispensing
-      saveLitersTotal();
-      
-      state = COMPLETING;
-      uiCompleting();
-      uploadReceiptOrQueue("DONE", "");
-      state = RECEIPT;
-    }
+      else if (k == '*' && newUserCode.length() > 0) {
+        newUserCode = newUserCode.substring(0, newUserCode.length() - 1);
+        lcdShow("NEW CODE", newUserCode);
+      }
+      else if (k == 'C') {
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      break;
+
+    case ST_ADD_USER_PIN:
+      if (isdigit(k)) {
+        newUserPin += k;
+        String mask = "";
+        for (size_t i = 0; i < newUserPin.length(); i++) mask += '*';
+        lcdShow("NEW PIN", mask);
+      }
+      else if (k == '#' && newUserPin.length() >= 2) {
+        state = ST_ADD_USER_ROLE;
+        lcdShow("SELECT ROLE", "1=OPR 2=SUPV");
+      }
+      else if (k == '*' && newUserPin.length() > 0) {
+        newUserPin = newUserPin.substring(0, newUserPin.length() - 1);
+        String mask = "";
+        for (size_t i = 0; i < newUserPin.length(); i++) mask += '*';
+        lcdShow("NEW PIN", mask);
+      }
+      else if (k == 'C') {
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      break;
+
+    case ST_ADD_USER_ROLE:
+      if (k == '1') {
+        // Add as Operator
+        if (addUser(newUserCode, newUserPin, OPERATOR)) {
+          lcdShow("USER ADDED!", "OPERATOR " + newUserCode);
+        } else {
+          lcdShow("FAILED!", "CODE EXISTS/FULL");
+        }
+        delay(1500);
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      else if (k == '2') {
+        // Add as Supervisor
+        if (addUser(newUserCode, newUserPin, SUPERVISOR)) {
+          lcdShow("USER ADDED!", "SUPV " + newUserCode);
+        } else {
+          lcdShow("FAILED!", "CODE EXISTS/FULL");
+        }
+        delay(1500);
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      else if (k == 'C') {
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      break;
+
+    case ST_CALIBRATE:
+      // Calibration menu: B starts 1L run into ST_DISPENSING, C goes back
+      if (k == 'B') {
+        dispensedLiters = 0;
+        flowPulses = 0;
+        lastPulse = 0;
+        relayOn();
+        ledsDispensing();
+        state = ST_DISPENSING;
+        lcdShow("CAL RUNNING", "#=STOP C=CNCL");
+      } else if (k == 'C') {
+        calibrationMode = false;
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      break;
+
+    case ST_DELETE_USER:
+      if (isdigit(k)) {
+        inputBuf += k;
+        lcdShow("DELETE CODE", inputBuf);
+      }
+      else if (k == '#' && inputBuf.length() > 0) {
+        if (deleteUser(inputBuf)) {
+          lcdShow("DELETED!", inputBuf);
+        } else {
+          lcdShow("NOT FOUND!", inputBuf);
+        }
+        delay(1500);
+        inputBuf = "";
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      else if (k == '*' && inputBuf.length() > 0) {
+        inputBuf = inputBuf.substring(0, inputBuf.length() - 1);
+        lcdShow("DELETE CODE", inputBuf);
+      }
+      else if (k == 'C') {
+        inputBuf = "";
+        state = ST_ADMIN_MENU;
+        lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+      }
+      break;
+
+    case ST_LIST_USERS:
+      {
+        int userCount = getUserCount();
+        if (k == '#' || k == 'B') {
+          // Next user
+          listUserIdx++;
+          if (listUserIdx >= userCount) listUserIdx = 0;
+        }
+        else if (k == '*' || k == 'A') {
+          // Previous user
+          listUserIdx--;
+          if (listUserIdx < 0) listUserIdx = userCount - 1;
+          if (listUserIdx < 0) listUserIdx = 0;
+        }
+        else if (k == 'C') {
+          state = ST_ADMIN_MENU;
+          lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
+          break;
+        }
+        
+        // Display current user
+        if (userCount > 0) {
+          Role r;
+          String code = getUserAtIndex(listUserIdx, r);
+          String roleStr = (r == SUPERVISOR) ? "SUP" : "OPR";
+          lcdShow(String(listUserIdx + 1) + ":" + code, roleStr + " */# NAV C=BACK");
+        } else {
+          lcdShow("NO USERS", "C=BACK");
+        }
+      }
+      break;
+
+    default:
+      break;
   }
-  
-  // Final watchdog reset at end of loop
-  feedWatchdog();
 }

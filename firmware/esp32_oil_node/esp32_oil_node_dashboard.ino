@@ -65,8 +65,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 // ========================= WIFI CONFIG =========================
-const char* WIFI_SSID = "";   // e.g. "MTN_4G"
-const char* WIFI_PASS = "";   // e.g. "password123"
+const char* WIFI_SSID = "kupemisa_4G";   // e.g. "MTN_4G"
+const char* WIFI_PASS = "password123";   // e.g. "password123"
 
 // ========================= PINS =========================
 // Pump relay control

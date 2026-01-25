@@ -43,8 +43,8 @@
 
 // ========================= WIFI (optional) =========================
 // If you want WiFi, set these. Otherwise it runs offline fine.
-const char* WIFI_SSID = "";   // e.g. "MTN_4G"
-const char* WIFI_PASS = "";   // e.g. "password"
+const char* WIFI_SSID = "KUPEMISA";   // e.g. "MTN_4G"
+const char* WIFI_PASS = "1234";   // e.g. "password"
 // ================================================================
 
 // ========================= PINS (D1 R32 safe) =========================

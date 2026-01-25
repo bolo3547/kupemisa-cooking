@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../../.."
+		},
+		{
+			"name": "esp32_oil_node",
+			"path": "."
+		}
+	],
+	"settings": {
+		"powershell.cwd": "esp32_oil_node"
+	}
+}
