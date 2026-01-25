@@ -163,6 +163,11 @@ model Device {
   lastSeenAt           DateTime?
   createdAt            DateTime              @default(now())
   
+  // WiFi credentials for device to connect
+  wifiSsid             String?               // WiFi network name
+  wifiPassword         String?               // WiFi password (stored encrypted in production)
+  wifiUpdatedAt        DateTime?             // When WiFi was last changed
+  
   telemetry            Telemetry[]
   events               Event[]
   alertRules           AlertRule[]

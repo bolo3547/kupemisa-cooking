@@ -87,6 +87,12 @@ export async function GET(request: NextRequest) {
         costPerLiter: price.costPerLiter,
         currency: price.currency,
       },
+      // WiFi credentials for device to use
+      wifi: authResult.device.wifiSsid ? {
+        ssid: authResult.device.wifiSsid,
+        password: authResult.device.wifiPassword || "",
+        updatedAt: authResult.device.wifiUpdatedAt?.getTime() || 0,
+      } : undefined,
       ...(display && { display }),
       timestamp: Date.now(),
     });

@@ -4,8 +4,9 @@ import { useEffect, useState } from 'react';
 import { useParams } from 'next/navigation';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -28,8 +29,9 @@ import {
   Legend,
 } from 'recharts';
 import { formatTimeAgo, getStatusColor, getSeverityColor, getCommandStatusColor } from '@/lib/utils';
-import { Droplet, Gauge, Activity, Wifi, Clock, Power } from 'lucide-react';
+import { Droplet, Gauge, Activity, Wifi, Clock, Power, Save, Eye, EyeOff } from 'lucide-react';
 import { FillingStationCard } from '@/components/filling-station-card';
+import { useToast } from '@/components/ui/use-toast';
 
 interface DeviceData {
   id: string;
@@ -89,6 +91,13 @@ export default function DeviceDetailPage() {
   const [commandLoading, setCommandLoading] = useState(false);
   const [targetLiters, setTargetLiters] = useState('');
   const [userSession, setUserSession] = useState<UserSession | null>(null);
+  
+  // WiFi settings state
+  const [wifiSsid, setWifiSsid] = useState('');
+  const [wifiPassword, setWifiPassword] = useState('');
+  const [wifiLoading, setWifiLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const { toast } = useToast();
 
   // Fetch user session
   useEffect(() => {
@@ -135,9 +144,50 @@ export default function DeviceDetailPage() {
     }
   };
 
+  // Fetch WiFi settings
+  const fetchWifi = async () => {
+    try {
+      const res = await fetch(`/api/devices/${deviceId}/wifi`);
+      if (res.ok) {
+        const data = await res.json();
+        if (data.ok && data.wifi) {
+          setWifiSsid(data.wifi.ssid || '');
+          setWifiPassword(data.wifi.password || '');
+        }
+      }
+    } catch (e) {
+      console.error('Failed to fetch WiFi settings:', e);
+    }
+  };
+
+  // Save WiFi settings
+  const saveWifi = async () => {
+    if (!wifiSsid.trim()) {
+      toast({ title: 'Error', description: 'WiFi SSID is required', variant: 'destructive' });
+      return;
+    }
+    setWifiLoading(true);
+    try {
+      const res = await fetch(`/api/devices/${deviceId}/wifi`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ssid: wifiSsid.trim(), password: wifiPassword }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        toast({ title: 'Success', description: 'WiFi settings saved. Device will connect on next restart.' });
+      } else {
+        toast({ title: 'Error', description: data.error || 'Failed to save WiFi settings', variant: 'destructive' });
+      }
+    } catch (e) {
+      toast({ title: 'Error', description: 'Failed to save WiFi settings', variant: 'destructive' });
+    }
+    setWifiLoading(false);
+  };
+
   useEffect(() => {
     setLoading(true);
-    Promise.all([fetchDevice(), fetchTelemetry()]).finally(() => setLoading(false));
+    Promise.all([fetchDevice(), fetchTelemetry(), fetchWifi()]).finally(() => setLoading(false));
     const interval = setInterval(() => {
       fetchDevice();
       fetchTelemetry();
@@ -325,6 +375,70 @@ export default function DeviceDetailPage() {
           </div>
         </CardContent>
       </Card>
+
+      {/* WiFi Settings Card (Owner only) */}
+      {isOwner && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Wifi className="h-5 w-5" />
+              WiFi Settings
+            </CardTitle>
+            <CardDescription>
+              Configure the WiFi network for this device to connect to. Changes take effect on device restart or next config fetch.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label htmlFor="wifi-ssid">WiFi Network Name (SSID)</Label>
+                <Input
+                  id="wifi-ssid"
+                  placeholder="Enter WiFi name"
+                  value={wifiSsid}
+                  onChange={(e) => setWifiSsid(e.target.value)}
+                  maxLength={32}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="wifi-password">WiFi Password</Label>
+                <div className="relative">
+                  <Input
+                    id="wifi-password"
+                    type={showPassword ? 'text' : 'password'}
+                    placeholder="Enter WiFi password"
+                    value={wifiPassword}
+                    onChange={(e) => setWifiPassword(e.target.value)}
+                    maxLength={64}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="absolute right-0 top-0 h-full px-3"
+                    onClick={() => setShowPassword(!showPassword)}
+                  >
+                    {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </Button>
+                </div>
+              </div>
+            </div>
+            <Button onClick={saveWifi} disabled={wifiLoading || !wifiSsid.trim()}>
+              {wifiLoading ? 'Saving...' : (
+                <>
+                  <Save className="h-4 w-4 mr-2" />
+                  Save WiFi Settings
+                </>
+              )}
+            </Button>
+            {wifiSsid && (
+              <p className="text-sm text-muted-foreground">
+                Current: <span className="font-medium">{wifiSsid}</span>
+              </p>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Commands History */}
       <Card>

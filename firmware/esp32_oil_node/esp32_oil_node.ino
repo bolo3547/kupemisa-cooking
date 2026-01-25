@@ -19,8 +19,8 @@
 #define API_KEY       "REDACTED"
 
 /* ================= WIFI ================= */
-const char* WIFI_SSID = "kupemisa";
-const char* WIFI_PASS = "123admin";
+const char* WIFI_SSID = "deborah-my-wife";
+const char* WIFI_PASS = "admin@29";
 
 /* ================= PRICING ================= */
 #define PRICE_PER_ML        0.045f
@@ -38,15 +38,37 @@ const char* WIFI_PASS = "123admin";
 // Wire to PIN_TAMPER or tie to GND if unused
 #define PIN_TAMPER 35
 
-/* ================= RELAY ================= */
+/* ================= RELAY (PUMP CONTROL) ================= */
+// Set to true if relay clicks ON when GPIO is LOW (most opto-isolated modules)
+// Set to false if relay clicks ON when GPIO is HIGH
 #define RELAY_ACTIVE_LOW true
 
-void relayOff() {
+bool pumpState = false;  // Track pump state to avoid constant GPIO writes
+
+void pumpOff() {
+  Serial.printf("[PUMP] pumpOff() called, pumpState=%d\n", pumpState);
+  // Always write to GPIO to ensure relay turns off
   digitalWrite(PIN_PUMP, RELAY_ACTIVE_LOW ? HIGH : LOW);
+  if (pumpState) {
+    pumpState = false;
+    Serial.println("[PUMP] OFF - relay should release");
+  }
 }
 
-void relayOn() {
-  digitalWrite(PIN_PUMP, RELAY_ACTIVE_LOW ? LOW : HIGH);
+void pumpOn() {
+  Serial.printf("[PUMP] pumpOn() called, pumpState=%d\n", pumpState);
+  if (!pumpState) {
+    digitalWrite(PIN_PUMP, RELAY_ACTIVE_LOW ? LOW : HIGH);
+    pumpState = true;
+    Serial.println("[PUMP] ON - relay should click");
+  }
+}
+
+// Force pump off regardless of state (for boot/emergency)
+void pumpForceOff() {
+  digitalWrite(PIN_PUMP, RELAY_ACTIVE_LOW ? HIGH : LOW);
+  pumpState = false;
+  Serial.println("[PUMP] FORCE OFF");
 }
 
 /* ================= LED CONFIG ================= */
@@ -356,7 +378,7 @@ void checkTamper() {
   if (val == HIGH && !tamperLatched) {
     // Tamper triggered (cabinet open)
     tamperLatched = true;
-    relayOff();
+    pumpOff();  // SAFETY: Immediate pump shutoff on tamper
     ledsError();
 
     if (isOnline) {
@@ -372,7 +394,12 @@ void checkTamper() {
   }
 }
 
-/* ================= DEVICE CONFIG (PRICE / DISPLAY) ================= */
+/* ================= DEVICE CONFIG (PRICE / DISPLAY / WIFI) ================= */
+// Store WiFi credentials received from dashboard
+String storedWifiSsid = "";
+String storedWifiPassword = "";
+unsigned long lastWifiUpdateTs = 0;
+
 void fetchDeviceConfig() {
   if (!isOnline) return;
   const unsigned long CONFIG_REFRESH_INTERVAL_MS = 60000; // 60s
@@ -395,7 +422,7 @@ void fetchDeviceConfig() {
   String body = http.getString();
   http.end();
 
-  StaticJsonDocument<512> doc;
+  StaticJsonDocument<768> doc;
   DeserializationError err = deserializeJson(doc, body);
   if (err) {
     Serial.println("[CONFIG] JSON parse error");
@@ -420,6 +447,31 @@ void fetchDeviceConfig() {
     unixTimeOffsetMs = serverTs - (long long)millis();
     hasTimeSync = true;
     Serial.printf("[CONFIG] Time sync offset=%lld ms\n", unixTimeOffsetMs);
+  }
+
+  // Check for WiFi credentials update from dashboard
+  const char* wifiSsid = doc["wifi"]["ssid"];
+  const char* wifiPass = doc["wifi"]["password"];
+  unsigned long wifiUpdatedAt = doc["wifi"]["updatedAt"] | 0UL;
+  
+  if (wifiSsid && strlen(wifiSsid) > 0 && wifiUpdatedAt > lastWifiUpdateTs) {
+    storedWifiSsid = String(wifiSsid);
+    storedWifiPassword = wifiPass ? String(wifiPass) : "";
+    lastWifiUpdateTs = wifiUpdatedAt;
+    
+    // Save to Preferences for next boot
+    prefs.begin("wifi", false);
+    prefs.putString("ssid", storedWifiSsid);
+    prefs.putString("pass", storedWifiPassword);
+    prefs.putULong("updated", lastWifiUpdateTs);
+    prefs.end();
+    
+    Serial.printf("[CONFIG] New WiFi received: %s (will use on next boot)\n", wifiSsid);
+    
+    // Show notification on LCD
+    lcdShow("NEW WIFI SAVED", storedWifiSsid.substring(0, 16));
+    delay(2000);
+    lcdShow("SYSTEM RUNNING", "ENTER CODE");
   }
 }
 
@@ -618,43 +670,60 @@ String getUserAtIndex(int idx, Role& outRole) {
 /* ================= LIVE DISPENSE DISPLAY ================= */
 void updateDispenseDisplay() {
   static unsigned long lastDispUpdateMs = 0;
-  const unsigned long DISP_UPDATE_INTERVAL_MS = 250; // 200–300 ms window
+  const unsigned long DISP_UPDATE_INTERVAL_MS = 250; // Update every 250ms
 
   unsigned long now = millis();
   if (now - lastDispUpdateMs < DISP_UPDATE_INTERVAL_MS) return;
   lastDispUpdateMs = now;
 
   int ml = (int)(dispensedLiters * 1000.0f);
-  String line1 = "DISPENSING";
-  while (line1.length() < 16) line1 += ' ';
-
-  String line2 = String(ml) + " ml";
-  while (line2.length() < 16) line2 += ' ';
-
+  int targetMl = (int)(targetLiters * 1000.0f);
+  
+  // Line 1: "DISPENSING..."
   lcd.setCursor(0, 0);
-  lcd.print(line1);
+  lcd.print("DISPENSING...   ");
+  
+  // Line 2: "1234 / 5000 ml"
+  String line2 = String(ml) + "/" + String(targetMl) + "ml";
+  while (line2.length() < 16) line2 += ' ';
   lcd.setCursor(0, 1);
   lcd.print(line2);
 }
 
 /* ================= FLOW ================= */
+// Set to true to simulate flow without a real sensor (FOR TESTING ONLY)
+#define SIMULATE_FLOW true   // <-- SET TO false FOR PRODUCTION WITH REAL SENSOR
+#define SIMULATED_FLOW_RATE 0.05f  // Liters per update (~50ml per 300ms = fast test)
+
 void updateFlow() {
   if (millis() - lastFlowMs < 300) return;
-  uint32_t p;
-  noInterrupts(); p = flowPulses; interrupts();
-  uint32_t dp = p - lastPulse;
-  lastPulse = p;
-  if (state == ST_DISPENSING) dispensedLiters += dp / pulsesPerLiter;
   lastFlowMs = millis();
+  
+  if (state == ST_DISPENSING) {
+    if (SIMULATE_FLOW) {
+      // Simulated flow for testing without sensor
+      dispensedLiters += SIMULATED_FLOW_RATE;
+      Serial.printf("[FLOW-SIM] dispensed=%.3f L, target=%.3f L\n", dispensedLiters, targetLiters);
+    } else {
+      // Real flow sensor
+      uint32_t p;
+      noInterrupts(); p = flowPulses; interrupts();
+      uint32_t dp = p - lastPulse;
+      lastPulse = p;
+      dispensedLiters += dp / pulsesPerLiter;
+      Serial.printf("[FLOW] pulses=%lu, delta=%lu, dispensed=%.3f L, target=%.3f L\n", p, dp, dispensedLiters, targetLiters);
+    }
+  }
 }
 
 /* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
   Serial.println("[BOOT] PIMISHA Oil Dispenser");
+  Serial.println("[BOOT] Firmware v2.3 - Dashboard WiFi Config");
 
   pinMode(PIN_PUMP, OUTPUT);
-  relayOff();
+  pumpForceOff();  // CRITICAL: Pump OFF at boot (force regardless of state)
 
   pinMode(PIN_LED_RED, OUTPUT);
   pinMode(PIN_LED_GREEN, OUTPUT);
@@ -675,7 +744,75 @@ void setup() {
   keypad.setDebounceTime(80);   // ms
   keypad.setHoldTime(700);      // ms
 
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Load WiFi credentials from Preferences (set by dashboard) or use defaults
+  char wifiSsid[64] = "";
+  char wifiPass[64] = "";
+  prefs.begin("wifi", true);  // read-only
+  String storedSsid = prefs.getString("ssid", "");
+  String storedPass = prefs.getString("pass", "");
+  prefs.end();
+  
+  if (storedSsid.length() > 0) {
+    // Use dashboard-configured WiFi
+    storedSsid.toCharArray(wifiSsid, sizeof(wifiSsid));
+    storedPass.toCharArray(wifiPass, sizeof(wifiPass));
+    Serial.printf("[WIFI] Using dashboard WiFi: %s\n", wifiSsid);
+  } else {
+    // Fall back to hardcoded defaults
+    strncpy(wifiSsid, WIFI_SSID, sizeof(wifiSsid) - 1);
+    strncpy(wifiPass, WIFI_PASS, sizeof(wifiPass) - 1);
+    Serial.printf("[WIFI] Using default WiFi: %s\n", wifiSsid);
+  }
+
+  // WiFi connection with status display
+  Serial.printf("[WIFI] Connecting to: %s\n", wifiSsid);
+  lcdShow("CONNECTING...", wifiSsid);
+  WiFi.begin(wifiSsid, wifiPass);
+  
+  // Wait up to 10 seconds for connection
+  int wifiTimeout = 20;  // 20 x 500ms = 10 seconds
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout > 0) {
+    delay(500);
+    Serial.print(".");
+    wifiTimeout--;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.printf("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+    lcdShow("WIFI CONNECTED", WiFi.localIP().toString());
+    delay(1500);
+  } else {
+    Serial.println();
+    Serial.printf("[WIFI] Failed to connect to: %s\n", wifiSsid);
+    // If dashboard WiFi failed, try fallback to hardcoded defaults
+    if (storedSsid.length() > 0) {
+      Serial.printf("[WIFI] Trying fallback: %s\n", WIFI_SSID);
+      lcdShow("TRYING BACKUP", WIFI_SSID);
+      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      wifiTimeout = 20;
+      while (WiFi.status() != WL_CONNECTED && wifiTimeout > 0) {
+        delay(500);
+        Serial.print(".");
+        wifiTimeout--;
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println();
+        Serial.printf("[WIFI] Backup connected! IP: %s\n", WiFi.localIP().toString().c_str());
+        lcdShow("WIFI CONNECTED", WiFi.localIP().toString());
+        delay(1500);
+      } else {
+        Serial.println();
+        Serial.println("[WIFI] All WiFi connections failed - running OFFLINE");
+        lcdShow("WIFI FAILED", "RUNNING OFFLINE");
+        delay(2000);
+      }
+    } else {
+      Serial.println("[WIFI] Connection failed - running OFFLINE");
+      lcdShow("WIFI FAILED", "RUNNING OFFLINE");
+      delay(2000);
+    }
+  }
 
   // Load calibrated pulses-per-liter if available
   prefs.begin("calib", true);
@@ -709,8 +846,7 @@ void loop() {
 
   // SAFETY: Pump OFF unless dispensing
   if (state != ST_DISPENSING) {
-    relayOff();
-    ledsIdle();
+    pumpOff();
   }
 
   // Scrolling welcome in menu state
@@ -726,7 +862,10 @@ void loop() {
     
     // Auto-stop when target reached (normal dispensing only)
     if (!calibrationMode && targetLiters > 0 && dispensedLiters >= (targetLiters - STOP_MARGIN_LITERS)) {
-      relayOff();
+      Serial.println("[AUTO-STOP] Target reached!");
+      Serial.printf("[AUTO-STOP] dispensed=%.3f, target=%.3f, margin=%.3f\n", 
+                    dispensedLiters, targetLiters, STOP_MARGIN_LITERS);
+      pumpOff();  // Target reached - stop pump
       ledsIdle();
       float mlDone = dispensedLiters * 1000;
       float paid = round2(mlDone * sessionPricePerMl);
@@ -751,18 +890,28 @@ void loop() {
   for (int i = 0; i < 16; i++) {
     if (k == validKeys[i]) { validKey = true; break; }
   }
-  if (!validKey) return;  // Ignore invalid/ghost keys
+  if (!validKey) {
+    Serial.printf("[KEY] INVALID/GHOST: 0x%02X\n", (int)k);
+    return;
+  }
   
   // Prevent same key repeating too fast (ghost protection)
-  if (k == lastKey && (millis() - lastKeyTime) < 80) return;
+  if (k == lastKey && (millis() - lastKeyTime) < 80) {
+    Serial.printf("[KEY] DEBOUNCE SKIP: %c\n", k);
+    return;
+  }
   lastKey = k;
   lastKeyTime = millis();
 
-  Serial.printf("[KEY] %c\\n", k);
+  // === KEY CONFIRMATION LOG ===
+  Serial.print("KEY PRESSED: ");
+  Serial.println(k);
+  Serial.printf("[KEY] char='%c' state=%d\n", k, (int)state);
 
   // * = EMERGENCY STOP (only when dispensing)
   if (k == '*' && state == ST_DISPENSING) {
-    relayOff();
+    Serial.println("[ESTOP] Emergency stop triggered!");
+    pumpOff();  // EMERGENCY: Immediate pump shutoff
     ledsError();
     if (calibrationMode) {
       // Abort calibration without sending a receipt
@@ -919,6 +1068,22 @@ void loop() {
 
     case ST_READY:
       if (k == 'B') {
+        Serial.println("[DISPENSE] ==============================");
+        Serial.println("[DISPENSE] START DISPENSING");
+        Serial.printf("[DISPENSE] targetLiters=%.4f\n", targetLiters);
+        Serial.printf("[DISPENSE] pricePerMl=%.4f\n", pricePerMl);
+        Serial.printf("[DISPENSE] amountZmw=%.2f\n", amountZmw);
+        
+        if (targetLiters <= 0) {
+          Serial.println("[DISPENSE] ERROR: targetLiters <= 0, aborting!");
+          lcdShow("ERROR", "INVALID TARGET");
+          delay(1500);
+          state = ST_AMOUNT;
+          amountZmw = 0;
+          lcdShow("ENTER AMOUNT", "K 0");
+          break;
+        }
+        
         dispensedLiters = 0;
         flowPulses = 0;
         lastPulse = 0;
@@ -928,9 +1093,17 @@ void loop() {
         sessionStartMs = millis();
         sessionCounter++;
         currentSessionId = String(DEVICE_ID) + "-" + String(sessionStartMs) + "-" + String(sessionCounter);
-        relayOn();
+        
+        Serial.printf("[DISPENSE] sessionId=%s\n", currentSessionId.c_str());
+        Serial.println("[DISPENSE] Activating pump...");
+        
+        pumpOn();  // START PUMP
         ledsDispensing();
         state = ST_DISPENSING;
+        
+        Serial.println("[DISPENSE] Pump activated, state=ST_DISPENSING");
+        Serial.println("[DISPENSE] ==============================");
+        lcdShow("DISPENSING", "0 ml");
       }
       else if (k == 'C') {
         // Cancel back to amount entry (keep value)
@@ -945,7 +1118,8 @@ void loop() {
       if (calibrationMode) {
         // In calibration, '#' finishes 1L run and saves pulsesPerLiter
         if (k == '#') {
-          relayOff();
+          Serial.println("[CAL] Calibration complete");
+          pumpOff();  // Stop pump for calibration end
           ledsIdle();
           noInterrupts();
           uint32_t pulses = flowPulses;
@@ -966,7 +1140,8 @@ void loop() {
           lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
         } else if (k == 'C') {
           // Cancel calibration without saving
-          relayOff();
+          Serial.println("[CAL] Calibration cancelled");
+          pumpOff();  // Stop pump on calibration cancel
           ledsIdle();
           calibrationMode = false;
           dispensedLiters = 0;
@@ -978,7 +1153,8 @@ void loop() {
       } else {
         // Normal dispensing: C = Cancel dispensing with partial receipt
         if (k == 'C') {
-          relayOff();
+          Serial.println("[DISPENSE] Cancelled by user");
+          pumpOff();  // Stop pump on user cancel
           ledsError();
           float mlDone = dispensedLiters * 1000;
           float paid = round2(mlDone * sessionPricePerMl);
@@ -1117,10 +1293,11 @@ void loop() {
     case ST_CALIBRATE:
       // Calibration menu: B starts 1L run into ST_DISPENSING, C goes back
       if (k == 'B') {
+        Serial.println("[CAL] Starting calibration run");
         dispensedLiters = 0;
         flowPulses = 0;
         lastPulse = 0;
-        relayOn();
+        pumpOn();  // Start pump for calibration
         ledsDispensing();
         state = ST_DISPENSING;
         lcdShow("CAL RUNNING", "#=STOP C=CNCL");
