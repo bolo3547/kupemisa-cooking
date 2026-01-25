@@ -176,6 +176,7 @@ model Device {
   priceSchedules       PriceSchedule[]
   dispenseTransactions DispenseTransaction[]
   shiftSummaries       ShiftSummary[]
+  tank                 Tank?
   owner                User                  @relation("DeviceOwner", fields: [ownerId], references: [id], onDelete: Cascade)
 
   @@index([deviceId])
@@ -319,4 +320,194 @@ model DeviceDisplayMessage {
 
   @@index([deviceId, expiresAt])
   @@index([expiresAt])
+}
+
+// ================= NEW FEATURES =================
+
+// Tank/Inventory Management
+model Tank {
+  id            String       @id @default(cuid())
+  deviceId      String       @unique
+  capacityLiters Float       @default(1000)  // Total tank capacity
+  currentLiters  Float       @default(0)     // Current level
+  lowThreshold   Float       @default(100)   // Alert when below this
+  lastRefillAt   DateTime?
+  updatedAt      DateTime    @updatedAt
+  
+  device        Device       @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  refills       TankRefill[]
+
+  @@index([deviceId])
+}
+
+model TankRefill {
+  id           String   @id @default(cuid())
+  tankId       String
+  litersAdded  Float
+  costPerLiter Float?
+  totalCost    Float?
+  supplier     String?
+  invoiceNo    String?
+  notes        String?  @db.Text
+  refilledAt   DateTime @default(now())
+  createdBy    String?
+  
+  tank         Tank     @relation(fields: [tankId], references: [id], onDelete: Cascade)
+
+  @@index([tankId, refilledAt])
+}
+
+// Operator Shifts & Limits
+model OperatorShift {
+  id          String    @id @default(cuid())
+  operatorId  String
+  deviceId    String
+  clockInAt   DateTime  @default(now())
+  clockOutAt  DateTime?
+  totalSales  Float     @default(0)
+  totalLiters Float     @default(0)
+  
+  @@index([operatorId, clockInAt])
+  @@index([deviceId, clockInAt])
+}
+
+model OperatorLimit {
+  id              String  @id @default(cuid())
+  operatorId      String  @unique
+  dailySalesLimit Float?  // Max ZMW per day
+  dailyLitersLimit Float? // Max liters per day
+  isActive        Boolean @default(true)
+  
+  @@index([operatorId])
+}
+
+// Customer Accounts & Loyalty
+model Customer {
+  id            String    @id @default(cuid())
+  ownerId       String    // Links to owner/user
+  name          String
+  phone         String?
+  email         String?
+  balance       Float     @default(0)  // Prepaid credit balance
+  loyaltyPoints Int       @default(0)
+  totalSpent    Float     @default(0)
+  totalLiters   Float     @default(0)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  
+  transactions  CustomerTransaction[]
+  topups        CustomerTopup[]
+
+  @@unique([ownerId, phone])
+  @@index([ownerId])
+  @@index([phone])
+}
+
+model CustomerTransaction {
+  id            String   @id @default(cuid())
+  customerId    String
+  deviceId      String
+  sessionId     String?  // Links to DispenseTransaction
+  amount        Float
+  liters        Float
+  pointsEarned  Int      @default(0)
+  paidFromBalance Float  @default(0)
+  paidCash      Float    @default(0)
+  createdAt     DateTime @default(now())
+  
+  customer      Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, createdAt])
+}
+
+model CustomerTopup {
+  id          String   @id @default(cuid())
+  customerId  String
+  amount      Float
+  method      String   // CASH, MOBILE_MONEY, BANK
+  reference   String?
+  createdAt   DateTime @default(now())
+  createdBy   String?
+  
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@index([customerId, createdAt])
+}
+
+// Discount Codes
+model DiscountCode {
+  id              String    @id @default(cuid())
+  ownerId         String
+  code            String
+  description     String?
+  discountPercent Float?    // e.g., 10 for 10%
+  discountAmount  Float?    // Fixed amount off
+  minPurchase     Float?    // Minimum purchase to apply
+  maxUses         Int?      // null = unlimited
+  usedCount       Int       @default(0)
+  validFrom       DateTime  @default(now())
+  validTo         DateTime?
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+
+  @@unique([ownerId, code])
+  @@index([ownerId, isActive])
+  @@index([code])
+}
+
+// Scheduled Price Changes
+model ScheduledPriceChange {
+  id              String    @id @default(cuid())
+  deviceId        String?   // null = all devices
+  ownerId         String
+  newPricePerLiter Float
+  effectiveAt     DateTime
+  applied         Boolean   @default(false)
+  appliedAt       DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([ownerId, effectiveAt])
+  @@index([applied, effectiveAt])
+}
+
+// Push Notification Subscriptions
+model PushSubscription {
+  id          String   @id @default(cuid())
+  userId      String
+  endpoint    String   @db.Text
+  p256dh      String
+  auth        String
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, endpoint(length: 255)])
+  @@index([userId])
+}
+
+// Notification Preferences
+model NotificationPreference {
+  id                   String  @id @default(cuid())
+  userId               String  @unique
+  emailDailySummary    Boolean @default(true)
+  emailLowStock        Boolean @default(true)
+  emailTamper          Boolean @default(true)
+  pushSales            Boolean @default(true)
+  pushLowStock         Boolean @default(true)
+  pushTamper           Boolean @default(true)
+  whatsappReceipts     Boolean @default(false)
+  whatsappPhone        String?
+  
+  @@index([userId])
+}
+
+// Two-Factor Authentication
+model TwoFactorAuth {
+  id          String    @id @default(cuid())
+  userId      String    @unique
+  secret      String    // TOTP secret
+  isEnabled   Boolean   @default(false)
+  backupCodes String[]  // Encrypted backup codes
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([userId])
 }

@@ -38,20 +38,20 @@ export default async function DashboardLayout({ children }: { children: React.Re
             </Link>
             {isOwner && (
               <>
-                <Link href="/dashboard/performance" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
-                Performance
+                <Link href="/dashboard/tank" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
+                  Tank
+                </Link>
+                <Link href="/dashboard/customers" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
+                  Customers
                 </Link>
                 <Link href="/dashboard/operators" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
                   Operators
                 </Link>
-                <Link href="/dashboard/pricing" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
-                  Pricing
+                <Link href="/dashboard/discounts" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
+                  Discounts
                 </Link>
-                <Link href="/dashboard/activity" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
-                  Activity
-                </Link>
-                <Link href="/dashboard/provision" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
-                  Add Tank
+                <Link href="/dashboard/settings" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
+                  Settings
                 </Link>
               </>
             )}

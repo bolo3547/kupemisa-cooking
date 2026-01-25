@@ -88,39 +88,53 @@ export function MobileNav({ isOwner, userEmail, userRole }: MobileNavProps) {
                   <>
                     <div className="border-t my-2" />
                     <Link 
+                      href="/dashboard/tank" 
+                      className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
+                      onClick={closeMenu}
+                    >
+                      🛢️ Tank
+                    </Link>
+                    <Link 
+                      href="/dashboard/customers" 
+                      className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
+                      onClick={closeMenu}
+                    >
+                      👥 Customers
+                    </Link>
+                    <Link 
                       href="/dashboard/operators" 
                       className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
                       onClick={closeMenu}
                     >
-                      Operators
+                      👷 Operators
                     </Link>
-                      <Link
-                        href="/dashboard/performance"
-                        className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
-                        onClick={closeMenu}
-                      >
-                        Performance
-                      </Link>
+                    <Link 
+                      href="/dashboard/discounts" 
+                      className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
+                      onClick={closeMenu}
+                    >
+                      🏷️ Discounts
+                    </Link>
                     <Link 
                       href="/dashboard/pricing" 
                       className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
                       onClick={closeMenu}
                     >
-                      Pricing
+                      💰 Pricing
                     </Link>
                     <Link 
                       href="/dashboard/activity" 
                       className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
                       onClick={closeMenu}
                     >
-                      Activity Logs
+                      📋 Activity Logs
                     </Link>
                     <Link 
-                      href="/dashboard/provision" 
+                      href="/dashboard/settings" 
                       className="px-4 py-3 text-sm hover:bg-muted rounded-md transition-colors"
                       onClick={closeMenu}
                     >
-                      Add Tank
+                      ⚙️ Settings
                     </Link>
                   </>
                 )}
