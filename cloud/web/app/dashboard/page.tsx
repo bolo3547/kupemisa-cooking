@@ -105,12 +105,12 @@ export default function DashboardPage() {
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.5 }}>
       <FadeIn>
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
+        <div className="flex flex-col gap-4 mb-6 sm:mb-8">
           <div>
-          <h1 className="text-3xl font-bold">Tanks Overview</h1>
-          <p className="text-muted-foreground">Monitoring {devices.length} tanks in real-time</p>
+          <h1 className="text-2xl sm:text-3xl font-bold">Tanks Overview</h1>
+          <p className="text-sm sm:text-base text-muted-foreground">Monitoring {devices.length} tanks in real-time</p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <ExportButton 
             data={filteredDevices.map(d => ({
               deviceId: d.deviceId,
@@ -181,7 +181,7 @@ export default function DashboardPage() {
       </SlideIn>
       
       <Stagger staggerDelay={0.05}>
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-4 mb-6 sm:mb-8">
           {[
             { count: statusCounts.OK, label: 'OK', color: 'text-green-600', bgColor: 'bg-green-50 dark:bg-green-950/20' },
             { count: statusCounts.LOW, label: 'Low', color: 'text-yellow-600', bgColor: 'bg-yellow-50 dark:bg-yellow-950/20' },
@@ -193,10 +193,10 @@ export default function DashboardPage() {
               variants={cardVariants}
               whileHover={hoverScale}
               whileTap={tapScale}
-              className={`notion-card p-6 text-center cursor-pointer ${stat.bgColor}`}
+              className={`notion-card p-3 sm:p-6 text-center cursor-pointer ${stat.bgColor}`}
             >
-              <div className={`text-4xl font-bold ${stat.color} mb-2`}>{stat.count}</div>
-              <div className="text-sm text-muted-foreground font-medium">{stat.label}</div>
+              <div className={`text-2xl sm:text-4xl font-bold ${stat.color} mb-1 sm:mb-2`}>{stat.count}</div>
+              <div className="text-xs sm:text-sm text-muted-foreground font-medium">{stat.label}</div>
             </motion.div>
           ))}
         </div>
@@ -244,13 +244,13 @@ export default function DashboardPage() {
                     <motion.div 
                       whileHover={{ scale: 1.02, y: -4 }}
                       whileTap={{ scale: 0.98 }}
-                      className="notion-card p-6 flex flex-col gap-3 h-full group cursor-pointer"
+                      className="notion-card p-4 sm:p-6 flex flex-col gap-2 sm:gap-3 h-full group cursor-pointer"
                     >
                       <div className="flex items-center justify-between">
-                        <Badge className={`${getStatusColor(device.status)} transition-all duration-200`}>{device.status}</Badge>
+                        <Badge className={`${getStatusColor(device.status)} transition-all duration-200 text-xs`}>{device.status}</Badge>
                         {preferences.showLastSeen && (
                           <span 
-                            className="text-xs text-muted-foreground flex items-center gap-1 cursor-help transition-colors group-hover:text-foreground"
+                            className="text-[10px] sm:text-xs text-muted-foreground flex items-center gap-1 cursor-help transition-colors group-hover:text-foreground"
                             title={device.lastSeenAt ? `Last seen: ${formatDateTime(device.lastSeenAt)}` : 'Never connected'}
                           >
                             {device.status === 'OFFLINE' ? (
@@ -262,16 +262,16 @@ export default function DashboardPage() {
                           </span>
                         )}
                       </div>
-                      <div className="flex items-baseline gap-2 mt-2">
+                      <div className="flex items-baseline gap-1 sm:gap-2 mt-1 sm:mt-2">
                         <motion.span 
-                          className="text-5xl font-bold transition-colors group-hover:text-primary"
+                          className="text-3xl sm:text-5xl font-bold transition-colors group-hover:text-primary"
                           initial={{ scale: 0 }}
                           animate={{ scale: 1 }}
                           transition={{ type: "spring", stiffness: 200, delay: index * 0.03 + 0.2 }}
                         >
                           {device.latestTelemetry?.oilPercent?.toFixed(0) ?? '--'}
                         </motion.span>
-                        <span className="text-xl text-muted-foreground">%</span>
+                        <span className="text-lg sm:text-xl text-muted-foreground">%</span>
                       </div>
                       <div className="w-full h-2 bg-secondary rounded-full overflow-hidden">
                         <motion.div 
@@ -282,15 +282,15 @@ export default function DashboardPage() {
                         />
                       </div>
                       <div className="mt-1">
-                        <div className="font-semibold truncate text-lg group-hover:text-primary transition-colors">{device.siteName}</div>
+                        <div className="font-semibold truncate text-base sm:text-lg group-hover:text-primary transition-colors">{device.siteName}</div>
                         {preferences.showLocation && device.location && (
-                          <div className="text-sm text-muted-foreground truncate">{device.deviceId} • {device.location}</div>
+                          <div className="text-xs sm:text-sm text-muted-foreground truncate">{device.deviceId} • {device.location}</div>
                         )}
                         {!preferences.showLocation && (
-                          <div className="text-sm text-muted-foreground truncate">{device.deviceId}</div>
+                          <div className="text-xs sm:text-sm text-muted-foreground truncate">{device.deviceId}</div>
                         )}
                       </div>
-                      <div className="flex items-center justify-between text-sm text-muted-foreground mt-2 pt-3 border-t border-border/50">
+                      <div className="flex items-center justify-between text-xs sm:text-sm text-muted-foreground mt-2 pt-2 sm:pt-3 border-t border-border/50">
                         <span className="font-medium">{device.latestTelemetry?.oilLiters?.toFixed(0) ?? '--'} L</span>
                         {preferences.showFlowRate && (
                           <span>{device.latestTelemetry?.flowLpm?.toFixed(1) ?? '--'} L/min</span>

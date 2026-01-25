@@ -218,36 +218,36 @@ export default function DeviceDetailPage() {
   const isOwner = userSession?.role === 'OWNER';
 
   return (
-    <div className="space-y-8">
+    <div className="space-y-6 sm:space-y-8">
       {/* Header */}
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
         <div>
-          <h1 className="text-2xl font-bold">{device.siteName}</h1>
-          <p className="text-muted-foreground">{device.deviceId} {device.location && `• ${device.location}`}</p>
+          <h1 className="text-xl sm:text-2xl font-bold">{device.siteName}</h1>
+          <p className="text-sm text-muted-foreground">{device.deviceId} {device.location && `• ${device.location}`}</p>
         </div>
         <Badge className={getStatusColor(device.status)}>{device.status}</Badge>
       </div>
 
       {/* Summary Cards */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Oil Level</CardTitle>
+          <CardHeader className="flex flex-row items-center justify-between pb-2 p-3 sm:p-6 sm:pb-2">
+            <CardTitle className="text-xs sm:text-sm font-medium">Oil Level</CardTitle>
             <Droplet className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-bold">{latest?.oilPercent?.toFixed(1) ?? '--'}%</div>
-            <p className="text-xs text-muted-foreground">{latest?.oilLiters?.toFixed(1) ?? '--'} liters</p>
+          <CardContent className="p-3 pt-0 sm:p-6 sm:pt-0">
+            <div className="text-2xl sm:text-3xl font-bold">{latest?.oilPercent?.toFixed(1) ?? '--'}%</div>
+            <p className="text-[10px] sm:text-xs text-muted-foreground">{latest?.oilLiters?.toFixed(1) ?? '--'} liters</p>
           </CardContent>
         </Card>
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between pb-2">
-            <CardTitle className="text-sm font-medium">Flow Rate</CardTitle>
+          <CardHeader className="flex flex-row items-center justify-between pb-2 p-3 sm:p-6 sm:pb-2">
+            <CardTitle className="text-xs sm:text-sm font-medium">Flow Rate</CardTitle>
             <Gauge className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
-          <CardContent>
-            <div className="text-3xl font-bold">{latest?.flowLpm?.toFixed(2) ?? '--'}</div>
-            <p className="text-xs text-muted-foreground">L/min</p>
+          <CardContent className="p-3 pt-0 sm:p-6 sm:pt-0">
+            <div className="text-2xl sm:text-3xl font-bold">{latest?.flowLpm?.toFixed(2) ?? '--'}</div>
+            <p className="text-[10px] sm:text-xs text-muted-foreground">L/min</p>
           </CardContent>
         </Card>
         <Card>

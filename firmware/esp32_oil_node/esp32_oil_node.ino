@@ -24,7 +24,12 @@ const char* WIFI_PASS = "admin@29";
 
 /* ================= PRICING ================= */
 #define PRICE_PER_ML        0.045f
-#define STOP_MARGIN_LITERS  0.005f
+#define STOP_MARGIN_LITERS  0.002f   // 2ml margin (reduced for accuracy)
+
+// Extra oil to dispense for small amounts (to account for pipe/hose volume)
+// This compensates for oil still in the pipe when pump stops
+#define SMALL_AMOUNT_THRESHOLD_ML  500.0f   // Amounts under 500ml get bonus
+#define SMALL_AMOUNT_BONUS_ML      30.0f    // Extra 30ml for small purchases
 
 /* ================= ADMIN CREDENTIALS ================= */
 #define ADMIN_CODE     "0000"
@@ -223,6 +228,7 @@ void resendQueue() {
   HTTPClient http;
   secureClient.setInsecure();
   http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/receipt");
+  http.setTimeout(3000);  // 3 second timeout for responsiveness
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-id", DEVICE_ID);
   http.addHeader("x-api-key", API_KEY);
@@ -286,6 +292,7 @@ void sendReceipt(float mlDispensed, float amountPaid, float targetMl, const char
     HTTPClient http;
     secureClient.setInsecure();
     http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/receipt");
+    http.setTimeout(3000);  // 3 second timeout for responsiveness
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-device-id", DEVICE_ID);
     http.addHeader("x-api-key", API_KEY);
@@ -321,6 +328,7 @@ void sendHeartbeat() {
   HTTPClient http;
   secureClient.setInsecure();
   http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/heartbeat");
+  http.setTimeout(3000);  // 3 second timeout for responsiveness
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-id", DEVICE_ID);
   http.addHeader("x-api-key", API_KEY);
@@ -410,6 +418,7 @@ void fetchDeviceConfig() {
   HTTPClient http;
   secureClient.setInsecure();
   http.begin(secureClient, String(API_BASE_URL) + "/api/device/config");
+  http.setTimeout(3000);  // 3 second timeout for responsiveness
   http.addHeader("x-device-id", DEVICE_ID);
   http.addHeader("x-api-key", API_KEY);
   int code = http.GET();
@@ -523,6 +532,7 @@ void resendUserSyncQueue() {
   HTTPClient http;
   secureClient.setInsecure();
   http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/operator");
+  http.setTimeout(3000);  // 3 second timeout for responsiveness
   http.addHeader("Content-Type", "application/json");
   http.addHeader("x-device-id", DEVICE_ID);
   http.addHeader("x-api-key", API_KEY);
@@ -557,6 +567,7 @@ void syncUserToDashboard(const String& code, const String& pin, Role role, bool 
     HTTPClient http;
     secureClient.setInsecure();
     http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/operator");
+    http.setTimeout(3000);  // 3 second timeout for responsiveness
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-device-id", DEVICE_ID);
     http.addHeader("x-api-key", API_KEY);
@@ -741,8 +752,8 @@ void setup() {
   lcd.backlight();
 
   // Let Keypad.h fully manage keypad GPIO modes
-  keypad.setDebounceTime(80);   // ms
-  keypad.setHoldTime(700);      // ms
+  keypad.setDebounceTime(30);   // ms - reduced for faster response
+  keypad.setHoldTime(500);      // ms
 
   // Load WiFi credentials from Preferences (set by dashboard) or use defaults
   char wifiSsid[64] = "";
@@ -896,7 +907,7 @@ void loop() {
   }
   
   // Prevent same key repeating too fast (ghost protection)
-  if (k == lastKey && (millis() - lastKeyTime) < 80) {
+  if (k == lastKey && (millis() - lastKeyTime) < 50) {
     Serial.printf("[KEY] DEBOUNCE SKIP: %c\n", k);
     return;
   }
@@ -1044,10 +1055,23 @@ void loop() {
           inputBuf = "";
           lcdShow("SYSTEM RUNNING", "ENTER CODE");
         } else {
-          targetLiters = (amountZmw / pricePerMl) / 1000.0f;
+          // Calculate base target from amount paid
+          float baseMl = (amountZmw / pricePerMl);
+          
+          // Add bonus for small amounts to compensate for pipe/hose volume
+          float bonusMl = 0;
+          if (baseMl < SMALL_AMOUNT_THRESHOLD_ML) {
+            bonusMl = SMALL_AMOUNT_BONUS_ML;
+            Serial.printf("[AMOUNT] Small amount bonus: +%.0f ml\n", bonusMl);
+          }
+          
+          targetLiters = (baseMl + bonusMl) / 1000.0f;
           state = ST_READY;
-          float ml = targetLiters * 1000;
-          lcdShow("CONFIRM", "K" + String((int)amountZmw) + "=" + String((int)ml) + "ml");
+          float displayMl = baseMl;  // Show what they paid for
+          float actualMl = baseMl + bonusMl;  // What they'll actually get
+          Serial.printf("[AMOUNT] Paid=K%.0f, Base=%.0f ml, Bonus=%.0f ml, Target=%.0f ml\n", 
+                        amountZmw, baseMl, bonusMl, actualMl);
+          lcdShow("CONFIRM", "K" + String((int)amountZmw) + "=" + String((int)displayMl) + "ml");
           delay(800);
           lcdShow("READY", "PRESS B");
         }

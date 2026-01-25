@@ -109,3 +109,61 @@
     @apply animate-in fade-in-0 slide-in-from-bottom-4 duration-500;
   }
 }
+
+/* Mobile-first responsive utilities */
+@layer utilities {
+  /* Ensure text doesn't overflow on small screens */
+  .text-responsive {
+    @apply text-sm sm:text-base;
+  }
+  
+  .heading-responsive {
+    @apply text-xl sm:text-2xl md:text-3xl;
+  }
+  
+  /* Touch-friendly tap targets (min 44px) */
+  .touch-target {
+    @apply min-h-[44px] min-w-[44px];
+  }
+  
+  /* Safe area for notched phones */
+  .safe-area-inset {
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}
+
+/* Prevent horizontal scroll on mobile */
+html, body {
+  overflow-x: hidden;
+  max-width: 100vw;
+}
+
+/* Better mobile input styling */
+@media (max-width: 640px) {
+  input, select, textarea, button {
+    font-size: 16px !important; /* Prevent zoom on iOS */
+  }
+  
+  /* Larger touch targets on mobile */
+  .notion-card {
+    @apply p-4;
+  }
+  
+  /* Better spacing on small screens */
+  .container {
+    @apply px-3;
+  }
+}
+
+/* Fix for small phones (iPhone SE, etc) */
+@media (max-width: 375px) {
+  .container {
+    @apply px-2;
+  }
+  
+  .notion-card {
+    @apply p-3 rounded-xl;
+  }
+}
