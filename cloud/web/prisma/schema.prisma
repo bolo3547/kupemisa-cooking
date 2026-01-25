@@ -479,7 +479,7 @@ model PushSubscription {
   auth        String
   createdAt   DateTime @default(now())
 
-  @@unique([userId, endpoint(length: 255)])
+  @@unique([userId, auth])
   @@index([userId])
 }
 
