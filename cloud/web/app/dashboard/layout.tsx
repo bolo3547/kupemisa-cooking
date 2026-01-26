@@ -19,10 +19,13 @@ export default async function DashboardLayout({ children }: { children: React.Re
     <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
       <header className="glass-effect sticky top-0 z-30 smooth-shadow">
         <div className="container mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
-          <Link href="/dashboard" className="flex items-center gap-2 group">
+          {/* Logo - hidden on mobile, shown on desktop */}
+          <Link href="/dashboard" className="hidden md:flex items-center gap-2 group">
             <Droplet className="h-7 w-7 text-primary transition-transform group-hover:scale-110 group-hover:rotate-12" />
-            <span className="text-base sm:text-lg font-semibold bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text">Pimisha</span>
+            <span className="text-lg font-semibold bg-gradient-to-r from-foreground to-foreground/70 bg-clip-text">Pimisha</span>
           </Link>
+          {/* Mobile: just show Pimisha text, no nav bar */}
+          <span className="md:hidden text-lg font-semibold">Pimisha</span>
           <nav className="hidden md:flex items-center gap-6">
             <Link href="/dashboard" className="text-sm text-muted-foreground hover:text-foreground transition-all duration-200 hover:scale-105">
               Dashboard

@@ -31,34 +31,72 @@ void processKeyInput(char k);
 #define API_KEY       "REDACTED"
 
 /* ================= WIFI ================= */
-const char* WIFI_SSID = "deborah-my-wife";
+const char* WIFI_SSID = "debora-my-wife";
 const char* WIFI_PASS = "admin@29";
 
 /* ================= PRICING ================= */
 /*******************************************************************************
- * METROLOGICAL PRICING - SINGLE SOURCE OF TRUTH
+ * PIMISHA PRICING - K25 PER LITER (Locked)
  * 
- * CORE RULE: ALL price/volume calculations MUST derive from PRICE_PER_ML.
+ * CORE RULE: Pricing is LOCAL. Dashboard CANNOT override.
  * 
- * Formula chain:
- *   PRICE_PER_ML = 0.045 K/ml (source of truth)
- *   PRICE_PER_LITER = PRICE_PER_ML * 1000 = 45 K/L (derived)
+ * Formula:
+ *   PRICE_PER_ML = 0.025 K/ml (K25 per liter)
+ *   targetMl = ceil(amountZmw / PRICE_PER_ML)
  *   
- * Money → Volume:  targetMl = amountZmw / PRICE_PER_ML
- * Volume → Money:  amountZmw = volumeMl * PRICE_PER_ML
- * 
- * ANTI-CHEATING: Never give more oil for less money. Rounding favors customer.
+ * Examples:
+ *   K1  → ceil(1/0.025)  = 40ml
+ *   K2  → ceil(2/0.025)  = 80ml
+ *   K5  → ceil(5/0.025)  = 200ml
+ *   K10 → ceil(10/0.025) = 400ml
+ *   K25 → 1000ml (1 Liter exact)
+ *   K50 → 2000ml (2 Liters exact)
+ *   
+ * ANTI-CHEATING: ceil() always rounds UP in customer's favor.
  ******************************************************************************/
-#define PRICE_PER_ML        0.045f   // K per milliliter (SOURCE OF TRUTH)
-#define PRICE_PER_LITER     (PRICE_PER_ML * 1000.0f)  // K45/L (DERIVED)
+#define PRICE_PER_ML        0.025f   // K per milliliter (K25/L) - LOCAL & LOCKED
+#define PRICE_PER_LITER     25.0f    // K25/L - LOCKED
 #define STOP_MARGIN_LITERS  0.005f   // 5ml max margin (regulatory limit)
+
+/*******************************************************************************
+ * COOKING OIL DISPENSING - CONSUMER PROTECTION COMPLIANCE
+ * 
+ * Regulatory Bodies for Cooking Oil in Zambia:
+ *   - CCPC: Competition and Consumer Protection Commission
+ *   - ZBS:  Zambia Bureau of Standards (ZABS)
+ *   - ZCSA: Zambia Compulsory Standards Agency
+ * 
+ * Consumer Protection:
+ *   - CCPC Hotline: +260 211 222787
+ *   - Website: https://www.ccpc.org.zm
+ * 
+ * Standards Reference:
+ *   - ZBS 104: Edible Fats and Oils - Cooking Oil Specification
+ *   - Weights & Measures Act (Chapter 403)
+ * 
+ * Metrological Compliance:
+ *   - Dispensing accuracy must be within ±0.5% of stated volume
+ *   - Price per unit must be clearly displayed
+ *   - Receipts must show volume dispensed and price charged
+ ******************************************************************************/
+#define CCPC_HOTLINE        "+260 211 222787"
+#define CCPC_WEBSITE        "https://www.ccpc.org.zm"
+#define ZBS_STANDARD        "ZBS 104"
+
+// PIMISHA cooking oil pricing (K25/L = K0.025/ml) - LOCKED
+// LOCAL AND LOCKED - Dashboard cannot override
+#define COOKING_OIL_PRICE_PER_LITER  25.0f  // K/L (LOCKED)
+
+// Metrological tolerance (Weights & Measures compliance)
+#define VOLUME_TOLERANCE_PERCENT  0.5f   // ±0.5% accuracy required
+// FIXED: PIMISHA - No minimum dispense limit, any amount allowed
 
 // Mismatch detection threshold
 #define MISMATCH_THRESHOLD_ZMW  1.00f  // Flag if difference > K1.00
 #define OVERSHOOT_LIMIT_ML      5.0f   // Never dispense more than 5ml extra
 
 // Calibration enforcement
-#define UNCALIBRATED_MAX_ML     500.0f // Max volume if not calibrated
+// REMOVED: UNCALIBRATED_MAX_ML - PIMISHA allows unlimited amounts
 #define CALIBRATION_REQUIRED_PPL 100.0f // Min pulsesPerLiter to be considered calibrated
 
 /*******************************************************************************
@@ -205,16 +243,33 @@ float pulsesPerLiter = 450.0f;
 float dispensedLiters = 0;
 uint32_t lastPulse = 0;
 uint32_t lastFlowMs = 0;
+
+// FIXED: Pulse-based dispensing control for accurate volume
+uint32_t targetPulses = 0;           // Locked at dispense start
+float sessionPulsesPerLiter = 450.0f; // Locked calibration value
 bool isCalibrated = false;  // Set true when pulsesPerLiter is saved from calibration
-void IRAM_ATTR onFlowPulse() { flowPulses++; }
+
+// SAFETY: Minimum dispense time before auto-stop (allows time for flow to start)
+
+// FIXED: Flow sensor debouncing to filter electrical noise
+volatile unsigned long lastPulseTime = 0;
+#define FLOW_DEBOUNCE_US 1000  // 1ms minimum between pulses (max 1000 pulses/sec)
+
+void IRAM_ATTR onFlowPulse() { 
+  unsigned long now = micros();
+  if (now - lastPulseTime >= FLOW_DEBOUNCE_US) {
+    flowPulses++;
+    lastPulseTime = now;
+  }
+}
 
 /* ================= SESSION ================= */
 enum Role { OPERATOR, SUPERVISOR, ADMIN };
 enum State {
   ST_LOGIN_CODE,
   ST_LOGIN_PIN,
-  ST_MENU,
-  ST_AMOUNT,
+  ST_PRESET,       // Preset selection menu (quick options)
+  ST_AMOUNT,       // Custom amount entry (any amount allowed)
   ST_READY,
   ST_DISPENSING,
   ST_ADMIN_MENU,
@@ -225,6 +280,36 @@ enum State {
   ST_LIST_USERS,
   ST_CALIBRATE
 };
+
+/*******************************************************************************
+ * PRESET DEFINITIONS (QUICK-SELECT OPTIONS)
+ * 
+ * These presets have FIXED volumes for convenience.
+ * PIMISHA price: K25/liter (0.025/mL) - LOCKED
+ * 
+ * Customers can buy ANY amount:
+ *   K1 → 40ml, K2 → 80ml, K5 → 200ml, K10 → 400ml, K25 → 1L
+ *****************************************************************************/
+// REMOVED: PRESET_MIN_CUSTOM_AMOUNT - PIMISHA allows any amount
+
+struct Preset {
+  int priceZmw;     // Price in Kwacha
+  int volumeMl;     // Fixed volume in mL
+  const char* label;// Display label
+};
+
+// PRESETS calculated from K25/L: volumeMl = ceil(priceZmw / 0.025)
+const Preset PRESETS[] = {
+  { 5,   200,  "K5-200mL"  },  // '1' key: ceil(5/0.025) = 200ml
+  { 10,  400,  "K10-400mL" },  // '2' key: ceil(10/0.025) = 400ml
+  { 25,  1000, "K25-1L"    },  // '3' key: 25/0.025 = 1000ml (1L exact)
+  { 50,  2000, "K50-2L"    },  // '4' key: 50/0.025 = 2000ml (2L exact)
+};
+const int NUM_PRESETS = 4;
+
+// Transaction type tracking
+String transactionType = "CUSTOM";  // "PRESET" or "CUSTOM"
+String presetLabel = "";            // e.g. "K5-200mL" or empty for custom
 
 State state = ST_LOGIN_CODE;
 Role currentRole = OPERATOR;
@@ -243,6 +328,11 @@ String inputBuf = "";
 String loginCode = "";
 float amountZmw = 0;
 float targetLiters = 0;
+int pendingTargetMl = 0;           // Locked target ml before dispense
+
+// FIXED: PIMISHA decimal input support (e.g., K33.75 for 750ml)
+bool decimalEntered = false;      // Track if '.' was pressed
+int decimalPlaces = 0;            // Track decimal digits entered (max 2)
 
 // Dynamic pricing (always derive per-ml)
 float pricePerMl = PRICE_PER_ML; // Source of truth
@@ -256,9 +346,13 @@ bool hasTimeSync = false;
 String currentSessionId = "";
 unsigned long sessionStartMs = 0;
 float sessionTargetLiters = 0.0f;
+int sessionTargetMl = 0;           // Locked target ml for session
 float sessionPricePerMl = PRICE_PER_ML;
 unsigned long sessionCounter = 0;
 String lastLoginPin = "";
+
+// Transaction type for receipts (set by preset or custom flow)
+int selectedPresetIdx = -1;  // -1 = custom, 0-3 = preset index
 
 // Tamper detection
 bool tamperLatched = false;
@@ -317,6 +411,15 @@ bool isOnline = false;
 bool wasOnline = false;  // Track previous state for reconnection handling
 unsigned long lastOperatorSyncMs = 0;
 bool operatorSyncPending = true;  // Sync on first boot
+
+/* ================= WIFI HEARTBEAT LED ================= */
+// FIXED: Non-blocking yellow LED blink when WiFi connected
+// Blinks 3 times every 30 seconds to indicate WiFi is active
+unsigned long lastWifiHeartbeatMs = 0;
+const unsigned long WIFI_HEARTBEAT_INTERVAL_MS = 30000;  // 30 seconds
+int wifiBlinkCount = 0;           // Tracks current blink (0-3)
+unsigned long wifiBlinkStartMs = 0;
+bool wifiBlinkInProgress = false;
 
 /*******************************************************************************
  * OPERATOR SYNC SYSTEM - BIDIRECTIONAL DASHBOARD SYNCHRONIZATION
@@ -762,7 +865,8 @@ void sendReceiptV2(float amountRequestedZmw, float targetMlCalculated, float dis
 
   // Build receipt JSON matching dashboard validation schema:
   // sessionId, targetLiters, dispensedLiters, status, startedAtUnix, endedAtUnix, durationSec
-  StaticJsonDocument<1024> doc;
+  // Increased to 1536 bytes to accommodate ERB compliance data
+  StaticJsonDocument<1536> doc;
   
   /***************************************************************************
    * REQUIRED FIELDS FOR DASHBOARD VALIDATION SCHEMA
@@ -792,6 +896,31 @@ void sendReceiptV2(float amountRequestedZmw, float targetMlCalculated, float dis
   doc["metrologyStatus"] = metrologyStatus;            // OK or MISMATCH
   doc["fairnessFlag"] = fairnessFlag;                  // NONE, FAIRNESS_ALERT, CUSTOMER_SHORTED
   doc["adjustmentRequired"] = adjustmentRequired;
+  
+  // TRANSACTION TYPE (PRESET or CUSTOM)
+  doc["transactionType"] = transactionType;            // "PRESET" or "CUSTOM"
+  if (transactionType == "PRESET" && presetLabel.length() > 0) {
+    doc["presetLabel"] = presetLabel;                  // e.g. "K5-200mL"
+  } else {
+    doc["presetLabel"] = (const char*)nullptr;         // null for custom
+  }
+  
+  /***************************************************************************
+   * CONSUMER PROTECTION COMPLIANCE - Cooking Oil Dispensing
+   * CCPC: Competition and Consumer Protection Commission
+   * ZBS: Zambia Bureau of Standards (ZBS 104)
+   * Hotline: +260 211 222787 | https://www.ccpc.org.zm
+   ***************************************************************************/
+  JsonObject compliance = doc.createNestedObject("compliance");
+  compliance["regulator"] = "CCPC - Consumer Protection";
+  compliance["hotline"] = CCPC_HOTLINE;
+  compliance["website"] = CCPC_WEBSITE;
+  compliance["standard"] = ZBS_STANDARD;
+  compliance["productType"] = "Cooking Oil";
+  compliance["pricePerLiter"] = COOKING_OIL_PRICE_PER_LITER;
+  compliance["volumeTolerancePercent"] = VOLUME_TOLERANCE_PERCENT;
+  compliance["metrologyCompliant"] = !isMismatch;   // Within regulatory tolerance
+  compliance["auditReady"] = true;                  // Receipt is audit-ready
   
   // Calibration and system info
   doc["pulsesPerLiter"] = usedPulsesPerLiter;
@@ -1013,12 +1142,10 @@ void fetchDeviceConfig() {
     return;
   }
 
-  // Price config: always derive from per-ml as source of truth
-  float newPricePerLiter = doc["price"]["pricePerLiter"] | 0.0f;
-  if (newPricePerLiter > 0.0f) {
-    pricePerMl = newPricePerLiter / 1000.0f;  // Convert to source of truth unit
-    Serial.printf("[CONFIG] Price updated: %.4f K/ml (%.2f K/L)\n", pricePerMl, newPricePerLiter);
-  }
+  // PIMISHA: Price is LOCAL AND LOCKED - dashboard cannot override
+  // float newPricePerLiter = doc["price"]["pricePerLiter"] | 0.0f;
+  // DISABLED: Dashboard price override
+  Serial.println("[CONFIG] Price is LOCAL: K25/L (dashboard override disabled)");
 
   const char* newSite = doc["siteName"]; 
   if (newSite && strlen(newSite) > 0) {
@@ -1356,14 +1483,17 @@ String getUserAtIndex(int idx, Role& outRole) {
  ******************************************************************************/
 void updateDispenseDisplay() {
   static unsigned long lastDispUpdateMs = 0;
-  const unsigned long DISP_UPDATE_INTERVAL_MS = 250; // Update every 250ms
+  const unsigned long DISP_UPDATE_INTERVAL_MS = 200; // FIXED: Update every 200ms for smoother display
 
   unsigned long now = millis();
   if (now - lastDispUpdateMs < DISP_UPDATE_INTERVAL_MS) return;
   lastDispUpdateMs = now;
 
-  int ml = (int)(dispensedLiters * 1000.0f);
-  int targetMl = (int)(targetLiters * 1000.0f);
+  // FIXED: Calculate ml directly from pulses for accuracy
+  uint32_t currentPulses;
+  noInterrupts(); currentPulses = flowPulses; interrupts();
+  int ml = (int)((currentPulses * 1000UL) / sessionPulsesPerLiter);
+  int targetMl = sessionTargetMl;
   
   // Line 1: Show progress with target
   String line1 = String(ml) + "/" + String(targetMl) + "ml";
@@ -1381,27 +1511,43 @@ void updateDispenseDisplay() {
 }
 
 /* ================= FLOW ================= */
-// Set to true to simulate flow without a real sensor (FOR TESTING ONLY)
-#define SIMULATE_FLOW true   // <-- SET TO false FOR PRODUCTION WITH REAL SENSOR
+// FIXED: Set to false for PRODUCTION with real flow sensor
+#define SIMULATE_FLOW false   // PRODUCTION MODE - real flow sensor active
 #define SIMULATED_FLOW_RATE 0.05f  // Liters per update (~50ml per 300ms = fast test)
 
+// DEBUG: Track pulse rate for diagnostics
+static uint32_t lastDebugPulses = 0;
+static unsigned long lastDebugTime = 0;
+
 void updateFlow() {
-  if (millis() - lastFlowMs < 300) return;
+  if (millis() - lastFlowMs < 100) return;  // FIXED: Check every 100ms for faster response
   lastFlowMs = millis();
   
   if (state == ST_DISPENSING) {
     if (SIMULATE_FLOW) {
       // Simulated flow for testing without sensor
-      dispensedLiters += SIMULATED_FLOW_RATE;
-      Serial.printf("[FLOW-SIM] dispensed=%.3f L, target=%.3f L\n", dispensedLiters, targetLiters);
+      flowPulses += (uint32_t)(SIMULATED_FLOW_RATE * sessionPulsesPerLiter);
+      dispensedLiters = (float)flowPulses / sessionPulsesPerLiter;
+      Serial.printf("[FLOW-SIM] pulses=%lu, target=%lu, dispensed=%.3f L\n", flowPulses, targetPulses, dispensedLiters);
     } else {
-      // Real flow sensor
+      // FIXED: Real flow sensor - direct pulse-to-volume calculation
+      // No cumulative float drift - always derive from pulse count
       uint32_t p;
       noInterrupts(); p = flowPulses; interrupts();
-      uint32_t dp = p - lastPulse;
-      lastPulse = p;
-      dispensedLiters += dp / pulsesPerLiter;
-      Serial.printf("[FLOW] pulses=%lu, delta=%lu, dispensed=%.3f L, target=%.3f L\n", p, dp, dispensedLiters, targetLiters);
+      dispensedLiters = (float)p / sessionPulsesPerLiter;
+      
+      // Calculate pulse rate for debugging
+      unsigned long now = millis();
+      if (now - lastDebugTime >= 1000) {
+        uint32_t pulseDelta = p - lastDebugPulses;
+        Serial.printf("[FLOW] pulses=%lu/%lu (%.0f%%), rate=%lu p/s, ml=%d/%d\n", 
+          p, targetPulses, (p * 100.0f / targetPulses),
+          pulseDelta, 
+          (int)((p * 1000UL) / sessionPulsesPerLiter),
+          sessionTargetMl);
+        lastDebugPulses = p;
+        lastDebugTime = now;
+      }
     }
   }
 }
@@ -1420,6 +1566,11 @@ void updateFlow() {
 void handleNetworkScheduler() {
   // Skip all network tasks if offline
   if (!isOnline) {
+    return;
+  }
+
+  // NEVER run network tasks during dispensing
+  if (state == ST_DISPENSING) {
     return;
   }
   
@@ -1551,65 +1702,112 @@ void handlePumpSafety() {
 }
 
 /*******************************************************************************
+ * WIFI HEARTBEAT LED BLINK (NON-BLOCKING)
+ * FIXED: Blinks yellow LED 3 times every 30 seconds when WiFi is connected.
+ * Uses millis() for non-blocking operation - no delay().
+ ******************************************************************************/
+void handleWifiHeartbeatLed() {
+  unsigned long now = millis();
+  
+  // Only blink when WiFi is connected
+  if (!isOnline) {
+    wifiBlinkInProgress = false;
+    wifiBlinkCount = 0;
+    return;
+  }
+  
+  // Check if it's time to start a new blink sequence (every 30 seconds)
+  if (!wifiBlinkInProgress && (now - lastWifiHeartbeatMs >= WIFI_HEARTBEAT_INTERVAL_MS)) {
+    wifiBlinkInProgress = true;
+    wifiBlinkCount = 0;
+    wifiBlinkStartMs = now;
+    lastWifiHeartbeatMs = now;
+    Serial.println("[LED] WiFi heartbeat - starting 3 blinks");
+  }
+  
+  // Handle ongoing blink sequence (3 blinks = 6 state changes)
+  if (wifiBlinkInProgress) {
+    unsigned long elapsed = now - wifiBlinkStartMs;
+    int phase = elapsed / 100;  // 100ms per phase (ON or OFF)
+    
+    if (phase < 6) {  // 3 blinks = 6 phases (ON-OFF-ON-OFF-ON-OFF)
+      // Even phases = LED ON, Odd phases = LED OFF
+      if (phase % 2 == 0) {
+        digitalWrite(PIN_LED_YELLOW, HIGH);
+      } else {
+        digitalWrite(PIN_LED_YELLOW, LOW);
+      }
+    } else {
+      // Blink sequence complete
+      digitalWrite(PIN_LED_YELLOW, LOW);
+      wifiBlinkInProgress = false;
+      wifiBlinkCount = 0;
+    }
+  }
+}
+
+/*******************************************************************************
  * DISPENSE AUTO-STOP CHECK (NON-BLOCKING)
  * 
  * Checks if target volume reached and stops pump.
  * CRITICAL: This must run every loop iteration during dispensing.
+ * 
+ * FIXED: Pulse-based stopping for accurate volume control.
+ * Uses integer pulse comparison - no floating point drift.
  ******************************************************************************/
 void handleDispenseAutoStop() {
   if (state != ST_DISPENSING) return;
   if (calibrationMode) return;
-  if (targetLiters <= 0) return;
+  if (targetPulses <= 0) return;
   
-  // Check if target reached
-  if (dispensedLiters >= (targetLiters - STOP_MARGIN_LITERS)) {
+  // PIMISHA: Stop pump ONLY when currentPulses >= targetPulses
+  uint32_t currentPulses;
+  noInterrupts(); currentPulses = flowPulses; interrupts();
+  
+  if (currentPulses >= targetPulses) {
     // CRITICAL: Stop pump immediately
     pumpOff();
     ledsIdle();
     
-    // Calculate final values for metrological verification
-    float mlDone = dispensedLiters * 1000.0f;
-    float targetMl = targetLiters * 1000.0f;
+    // PIMISHA: Calculate ml using integer math
+    int mlDone = (int)((currentPulses * 1000UL) / sessionPulsesPerLiter);
+    int targetMl = sessionTargetMl;
+    dispensedLiters = currentPulses / sessionPulsesPerLiter;
     
     // Log dispense completion
     Serial.println("[AUTO-STOP] ===== DISPENSE COMPLETE =====");
-    Serial.printf("[AUTO-STOP] Target: %.3f L (%.1f ml)\n", targetLiters, targetMl);
-    Serial.printf("[AUTO-STOP] Dispensed: %.6f L (%.3f ml)\n", dispensedLiters, mlDone);
-    Serial.printf("[AUTO-STOP] Stop margin: %.3f L (%.1f ml)\n", STOP_MARGIN_LITERS, STOP_MARGIN_LITERS * 1000.0f);
-    Serial.printf("[AUTO-STOP] Undershoot: %.3f ml\n", targetMl - mlDone);
+    Serial.printf("[AUTO-STOP] Target: %d ml, %lu pulses\n", targetMl, targetPulses);
+    Serial.printf("[AUTO-STOP] Dispensed: %d ml, %lu pulses\n", mlDone, currentPulses);
     Serial.println("[AUTO-STOP] =============================");
     
-    // Send receipt with cross-check verification (uses session-locked price)
-    sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS);
-    
-    // Calculate fairness display values
-    float paidAmount = amountZmw;
-    float gotMl = mlDone;
-    float gotValueZmw = gotMl * sessionPricePerMl;
-    float diffDisplay = fabs(gotValueZmw - paidAmount);
-    bool showMismatchWarning = (diffDisplay > MISMATCH_THRESHOLD_ZMW);
+    // Send receipt
+    sendReceiptV2(amountZmw, (float)targetMl, (float)mlDone, sessionPricePerMl, sessionPulsesPerLiter, STOP_MARGIN_LITERS);
     
     // Save values for display before reset
-    float savedAmountZmw = amountZmw;
-    int displayMl = (int)gotMl;
-    int displayPaid = (int)savedAmountZmw;
+    int displayPaid = (int)amountZmw;
+    String savedTransactionType = transactionType;
     
     // Reset state
     state = ST_LOGIN_CODE;
     inputBuf = "";
     dispensedLiters = 0;
     targetLiters = 0;
+    pendingTargetMl = 0;
+    sessionTargetMl = 0;
+    targetPulses = 0;
     amountZmw = 0;
     calibrationMode = false;
+    transactionType = "";
+    presetLabel = "";
+    selectedPresetIdx = -1;
     
-    // Show fairness display (these delays are acceptable - dispense is complete)
-    lcdShow("PAID: K" + String(displayPaid), "GOT: " + String(displayMl) + " mL");
-    delay(2500);
-    
-    if (showMismatchWarning) {
-      lcdShow("CHECK AMOUNT", "DIFF: K" + String((int)diffDisplay));
-      delay(2500);
+    // Show result with integer ml
+    if (savedTransactionType == "PRESET") {
+      lcdShow("PRESET: K" + String(displayPaid), "GOT: " + String(mlDone) + " mL");
+    } else {
+      lcdShow("PAID: K" + String(displayPaid), "GOT: " + String(mlDone) + " mL");
     }
+    delay(2500);
     
     lcdShow("SYSTEM RUNNING", "ENTER CODE");
   }
@@ -1643,12 +1841,27 @@ void setup() {
   Serial.printf("    Operator sync:   %d ms\n", SCHED_OPERATOR_SYNC_MS);
   Serial.println("---------------------------------------------------------------");
   Serial.println("  PRICING (Single Source of Truth):");
-  Serial.printf("    PRICE_PER_ML:    K%.6f per ml\n", PRICE_PER_ML);
+  Serial.printf("    PRICE_PER_ML:    K%.4f per ml\n", PRICE_PER_ML);
   Serial.printf("    PRICE_PER_LITER: K%.2f per liter\n", PRICE_PER_LITER);
+  Serial.println("---------------------------------------------------------------");
+  Serial.println("  PIMISHA VERIFICATION (K25/L):");
+  Serial.printf("    K1  -> %d ml\n", (int)ceil(1.0f / PRICE_PER_ML));
+  Serial.printf("    K2  -> %d ml\n", (int)ceil(2.0f / PRICE_PER_ML));
+  Serial.printf("    K5  -> %d ml\n", (int)ceil(5.0f / PRICE_PER_ML));
+  Serial.printf("    K10 -> %d ml\n", (int)ceil(10.0f / PRICE_PER_ML));
+  Serial.printf("    K25 -> %d ml (1L)\n", (int)ceil(25.0f / PRICE_PER_ML));
+  Serial.printf("    K50 -> %d ml (2L)\n", (int)ceil(50.0f / PRICE_PER_ML));
+  Serial.printf("    K100-> %d ml\n", (int)ceil(100.0f / PRICE_PER_ML));
   Serial.println("---------------------------------------------------------------");
   Serial.println("  METROLOGICAL LIMITS:");
   Serial.printf("    Stop margin:     %.1f ml\n", STOP_MARGIN_LITERS * 1000.0f);
   Serial.printf("    Mismatch:        K%.2f threshold\n", MISMATCH_THRESHOLD_ZMW);
+  Serial.println("---------------------------------------------------------------");
+  Serial.println("  FLOW SENSOR CALIBRATION:");
+  Serial.printf("    pulsesPerLiter:  %.2f pulses/L\n", pulsesPerLiter);
+  Serial.printf("    Calibrated:      %s\n", isCalibrated ? "YES" : "NO (using default 450)");
+  Serial.println("    *** IF NOT PUMPING CORRECT VOLUME: RUN CALIBRATION! ***");
+  Serial.println("    *** Admin Menu -> Option 4 -> Measure exactly 1L ***");
   Serial.println("===============================================================");
   Serial.println();
 
@@ -1660,8 +1873,10 @@ void setup() {
   pinMode(PIN_LED_YELLOW, OUTPUT);
   ledsIdle();
 
-  pinMode(PIN_FLOW, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIN_FLOW), onFlowPulse, RISING);
+  // FIXED: Flow sensor with internal pull-up to reduce noise
+  pinMode(PIN_FLOW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_FLOW), onFlowPulse, FALLING);  // FALLING for pull-up config
+  Serial.println("[FLOW] Flow sensor initialized with INPUT_PULLUP, FALLING edge, 1ms debounce");
 
   // Optional tamper switch (normally-closed to GND)
   pinMode(PIN_TAMPER, INPUT_PULLUP);
@@ -1764,6 +1979,9 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     isOnline = true;
     wasOnline = true;
+    // FIXED: Set handshake timeout for faster UI responsiveness
+    secureClient.setHandshakeTimeout(2);  // 2 second TLS timeout
+    Serial.println("[BOOT] WiFi connected - TLS handshake timeout set to 2s");
     Serial.println("[BOOT] WiFi connected - syncing operators from dashboard...");
     fetchOperatorsFromDashboard();
     fetchDeviceConfig();
@@ -1827,11 +2045,11 @@ void loop() {
   // =========================================================================
   // STEP 6: DISPLAY UPDATES (NON-BLOCKING, CACHED)
   // =========================================================================
-  if (state == ST_MENU) {
+  if (state == ST_LOGIN_CODE) {
     scrollWelcome();
     // Use direct LCD write for bottom line (scrolling text on top)
     lcd.setCursor(0, 1);
-    lcd.print("ENTER SALE C=OUT");
+    lcd.print("ENTER CODE");
   }
   
   if (state == ST_DISPENSING) {
@@ -1849,6 +2067,12 @@ void loop() {
   }
   wasOnline = currentlyOnline;
   isOnline = currentlyOnline;
+  
+  // =========================================================================
+  // STEP 7.5: WIFI HEARTBEAT LED (NON-BLOCKING)
+  // FIXED: Blink yellow LED 3x every 30s when WiFi connected
+  // =========================================================================
+  handleWifiHeartbeatLed();
   
   // =========================================================================
   // STEP 8: TAMPER CHECK (NON-BLOCKING)
@@ -1894,21 +2118,38 @@ void processKeyInput(char k) {
       lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
     } else {
       if (dispensedLiters > 0) {
-        float mlDone = dispensedLiters * 1000.0f;
-        float targetMl = targetLiters * 1000.0f;
+        // FIXED: Calculate ml from pulses for accuracy
+        uint32_t currentPulses;
+        noInterrupts(); currentPulses = flowPulses; interrupts();
+        float mlDone = (currentPulses * 1000.0f) / sessionPulsesPerLiter;
+        float targetMl = (float)sessionTargetMl;
         // Emergency stop = CANCELED status
-        sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS, "CANCELED");
+        sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, sessionPulsesPerLiter, STOP_MARGIN_LITERS, "CANCELED");
         float actualPaid = mlDone * sessionPricePerMl;
         state = ST_LOGIN_CODE;
         inputBuf = "";
         amountZmw = 0;
         dispensedLiters = 0;
+        targetPulses = 0;  // FIXED: Reset pulse target
+        targetLiters = 0;
+        pendingTargetMl = 0;
+        sessionTargetMl = 0;
+        transactionType = "";
+        presetLabel = "";
+        selectedPresetIdx = -1;
         lcdShow("E-STOP", String((int)mlDone) + "ml K" + String((int)actualPaid));
       } else {
         state = ST_LOGIN_CODE;
         inputBuf = "";
         amountZmw = 0;
         dispensedLiters = 0;
+        targetPulses = 0;  // FIXED: Reset pulse target
+        targetLiters = 0;
+        pendingTargetMl = 0;
+        sessionTargetMl = 0;
+        transactionType = "";
+        presetLabel = "";
+        selectedPresetIdx = -1;
         lcdShow("!! STOPPED !!", "* pressed");
       }
       delay(1500);
@@ -1994,15 +2235,24 @@ void processKeyInput(char k) {
             delay(1000);
             
             /***************************************************************************
-             * MONEY-FIRST DISPENSING FLOW (MANDATORY)
+             * FIXED: PIMISHA UNLIMITED AMOUNT DISPENSING FLOW
              * 
-             * The user MUST enter MONEY first (Kwacha).
-             * Volume is ALWAYS derived from money.
-             * Presets are just shortcuts for money values.
+             * PIMISHA = "Buy any amount" - customers can purchase ANY amount of oil.
+             * 
+             * Flow:
+             *   LOGIN → PRESETS/CUSTOM → CONFIRM → DISPENSE
+             * 
+             * Presets: 1=K5(200mL), 2=K10(400mL), 3=K25(1L), 4=K50(2L)
+             * Custom: Press 'A' for ANY custom amount (K1, K2, K5, etc.)
+             * 
+             * Fairness: Custom amounts are ROUNDED UP to favor customer.
              ***************************************************************************/
             amountZmw = 0;
-            state = ST_AMOUNT;
-            lcdShow("ENTER K (ZMW)", "AMOUNT: 0");
+            transactionType = "CUSTOM";
+            presetLabel = "";
+            selectedPresetIdx = -1;
+            state = ST_PRESET;
+            lcdShow("PRESETS", "1:K5 2:K10 A=AMT");
           }
         } else {
           lcdShow("INVALID PIN!", "TRY AGAIN");
@@ -2021,14 +2271,69 @@ void processKeyInput(char k) {
       }
       break;
 
-    case ST_MENU:
-      if (k == 'A') { 
-        amountZmw = 0; 
-        state = ST_AMOUNT; 
-        lcdShow("ENTER AMOUNT", "K 0"); 
+    /***************************************************************************
+     * ST_PRESET: Preset selection menu
+     * 
+     * FIXED: PIMISHA - Presets are OPTIONAL quick-select options.
+     * 
+     * Keys:
+    *   1 = K5 (200mL)
+    *   2 = K10 (400mL)  
+    *   3 = K25 (1L)
+    *   4 = K50 (2L)
+     *   A = Custom amount (ANY amount - K1, K2, K3, etc.)
+     *   C = Cancel/Logout
+    *   * = Show more presets (3:K25 4:K50)
+     ***************************************************************************/
+    case ST_PRESET:
+      if (k == '1' || k == '2' || k == '3' || k == '4') {
+        int idx = k - '1';  // 0-3
+        if (idx >= 0 && idx < NUM_PRESETS) {
+          // Select preset
+          selectedPresetIdx = idx;
+          amountZmw = PRESETS[idx].priceZmw;
+          pendingTargetMl = PRESETS[idx].volumeMl;
+          targetLiters = pendingTargetMl / 1000.0f;
+          transactionType = "PRESET";
+          presetLabel = PRESETS[idx].label;
+          
+          Serial.println("[PRESET] ==============================");
+          Serial.printf("[PRESET] Selected: %s\n", PRESETS[idx].label);
+          Serial.printf("[PRESET] Price: K%d\n", PRESETS[idx].priceZmw);
+          Serial.printf("[PRESET] Volume: %d mL (FIXED)\n", PRESETS[idx].volumeMl);
+          Serial.printf("[PRESET] targetLiters: %.4f\n", targetLiters);
+          Serial.println("[PRESET] ==============================");
+          
+          // Show confirmation
+          String line1 = "PAY:K" + String(PRESETS[idx].priceZmw) + " GET:" + String(PRESETS[idx].volumeMl) + "mL";
+          lcdShow("PRESET", line1);
+          delay(1200);
+          lcdShow("B=START C=BACK", presetLabel);
+          
+          state = ST_READY;
+        }
+      }
+      else if (k == 'A') {
+        // PIMISHA unlimited amount - Go to custom amount entry (any amount including decimals)
+        amountZmw = 0;
+        decimalEntered = false;
+        decimalPlaces = 0;
+        transactionType = "CUSTOM";
+        presetLabel = "";
+        selectedPresetIdx = -1;
+        state = ST_AMOUNT;
+        lcdShow("CUSTOM (D=.)", "ENTER K: 0");
+      }
+      else if (k == '*') {
+        // Show more presets
+        lcdShow("PRESETS", "3:K25 4:K50");
+      }
+      else if (k == '#') {
+        // Show first presets again
+        lcdShow("PRESETS", "1:K5 2:K10 A=AMT");
       }
       else if (k == 'C') {
-        // C = Cancel/Logout
+        // Cancel/Logout
         state = ST_LOGIN_CODE;
         inputBuf = "";
         lcdShow("SYSTEM RUNNING", "ENTER CODE");
@@ -2036,76 +2341,125 @@ void processKeyInput(char k) {
       break;
 
     case ST_AMOUNT:
+      /***************************************************************************
+       * FIXED: PIMISHA DECIMAL INPUT SUPPORT
+       * 
+       * Keys:
+       *   0-9 = Enter digits
+       *   D   = Decimal point (e.g., K33.75)
+       *   *   = Backspace
+       *   #   = Confirm amount
+       *   C   = Cancel
+       * 
+       * Example: K33.75 = press 3, 3, D, 7, 5, #
+       ***************************************************************************/
       if (isdigit(k)) {
-        amountZmw = amountZmw * 10 + (k - '0');
-        // Show money-first entry clearly
-        lcdShow("ENTER K (ZMW)", "AMOUNT: " + String((int)amountZmw));
-      } 
+        if (decimalEntered) {
+          // After decimal point - add fractional digits (max 2)
+          if (decimalPlaces < 2) {
+            decimalPlaces++;
+            float fraction = (k - '0') / pow(10.0f, decimalPlaces);
+            amountZmw += fraction;
+          }
+        } else {
+          // Before decimal point - whole number
+          amountZmw = amountZmw * 10 + (k - '0');
+        }
+        // Display with decimals if entered
+        if (decimalEntered) {
+          lcdShow("AMOUNT (D=.)", "K" + String(amountZmw, decimalPlaces));
+        } else {
+          lcdShow("AMOUNT (D=.)", "K" + String((int)amountZmw));
+        }
+      }
+      else if (k == 'D' && !decimalEntered) {
+        // FIXED: 'D' key enters decimal point
+        decimalEntered = true;
+        decimalPlaces = 0;
+        lcdShow("AMOUNT (D=.)", "K" + String((int)amountZmw) + ".");
+      }
       else if (k == '#' && amountZmw > 0) {
-        if (pricePerMl <= 0.0f) {
+        /***************************************************************************
+         * PIMISHA: INTEGER ML CALCULATION
+         * 
+         * targetMl = ceil(amountZmw / PRICE_PER_ML)
+         * targetPulses = ceil((targetMl / 1000.0) * pulsesPerLiter)
+         * 
+         * Examples at K25/L (0.025/ml):
+         *   K1 → ceil(1/0.025) = 40ml
+         *   K2 → ceil(2/0.025) = 80ml
+         *   K5 → ceil(5/0.025) = 200ml
+         ***************************************************************************/
+        
+        if (PRICE_PER_ML <= 0.0f) {
           lcdShow("PRICE ERROR", "CONFIG MISSING");
-          Serial.println("[ERROR] pricePerMl <= 0, cannot calculate volume");
+          Serial.println("[ERROR] PRICE_PER_ML <= 0");
           delay(1500);
           amountZmw = 0;
           state = ST_LOGIN_CODE;
           inputBuf = "";
           lcdShow("SYSTEM RUNNING", "ENTER CODE");
         } else {
-          // METROLOGICAL CALCULATION: Money → Volume (exact, no rounding for control)
-          // Formula: targetMl = amountZmw / PRICE_PER_ML
-          float targetMlExact = amountZmw / pricePerMl;
-          float targetLitersExact = targetMlExact / 1000.0f;
+          // PIMISHA: Integer ml calculation with ceil() for customer favor
+          int targetMl = (int)ceil(amountZmw / PRICE_PER_ML);
+          pendingTargetMl = targetMl;
           
-          // CALIBRATION DEPENDENCY: Restrict large volumes if uncalibrated
-          if (!isCalibrated && targetMlExact > UNCALIBRATED_MAX_ML) {
-            Serial.printf("[CALIB] Volume %.0f ml exceeds uncalibrated limit %.0f ml\n", targetMlExact, UNCALIBRATED_MAX_ML);
-            lcdShow("CALIB REQUIRED", "MAX " + String((int)UNCALIBRATED_MAX_ML) + "ml");
-            delay(2000);
-            amountZmw = 0;
-            lcdShow("ENTER K (ZMW)", "AMOUNT: 0");
-            break;
-          }
+          // Mark as CUSTOM transaction
+          transactionType = "CUSTOM";
+          presetLabel = "";
+          selectedPresetIdx = -1;
           
-          targetLiters = targetLitersExact;
+          // Store as liters for dispensing (integer ml / 1000)
+          targetLiters = (float)pendingTargetMl / 1000.0f;
           state = ST_READY;
           
-          // Log exact values for audit trail
-          Serial.println("[METROLOGY] ==============================");
-          Serial.printf("[METROLOGY] Amount entered: K%.2f\n", amountZmw);
-          Serial.printf("[METROLOGY] Price per ml: K%.6f\n", pricePerMl);
-          Serial.printf("[METROLOGY] Target ml (exact): %.6f\n", targetMlExact);
-          Serial.printf("[METROLOGY] Target liters (exact): %.9f\n", targetLitersExact);
-          Serial.printf("[METROLOGY] Calibrated: %s\n", isCalibrated ? "YES" : "NO");
-          Serial.println("[METROLOGY] ==============================");
+          // Log calculation
+          Serial.println("[CUSTOM] ==============================");
+          Serial.printf("[CUSTOM] Amount: K%.2f\n", amountZmw);
+          Serial.printf("[CUSTOM] Price: K%.3f/ml (K%.0f/L)\n", PRICE_PER_ML, PRICE_PER_LITER);
+          Serial.printf("[CUSTOM] Target: %d ml\n", targetMl);
+          Serial.println("[CUSTOM] ==============================");
           
-          /***************************************************************************
-           * MONEY-FIRST DISPENSING CONFIRMATION (per specification)
-           * 
-           * Flow enforced:
-           *   ENTER AMOUNT (ZMW) → CALCULATE TARGET ML → SHOW CONFIRMATION
-           *   → PRESS B TO START → DISPENSE → AUTO-STOP
-           * 
-           * User MUST enter money first. Volume is ALWAYS derived from money.
-           ***************************************************************************/
-          int displayMl = (int)targetMlExact;  // Show exact calculated ml
-          
-          // Show confirmation: what they're paying and what they'll get
-          lcdShow("PAY: K" + String((int)amountZmw), "GET: " + String(displayMl) + "mL");
+          // Show what they pay and get (integer ml only)
+          lcdShow("PAY:K" + String((int)amountZmw), "GET:" + String(targetMl) + "mL");
           delay(1200);
-          lcdShow("CONFIRM? B=YES", "C=CANCEL");
+          lcdShow("B=START C=BACK", "CUSTOM");
         }
       }
       else if (k == 'C') {
-        // Cancel back to login
+        // Cancel back to preset menu - reset all custom amount state
         amountZmw = 0;
-        state = ST_LOGIN_CODE;
-        inputBuf = "";
-        lcdShow("SYSTEM RUNNING", "ENTER CODE");
+        decimalEntered = false;
+        decimalPlaces = 0;
+        pendingTargetMl = 0;
+        state = ST_PRESET;
+        lcdShow("PRESETS", "1:K5 2:K10 A=AMT");
       }
       else if (k == '*') {
-        // Backspace
-        amountZmw = (int)(amountZmw / 10);
-        lcdShow("ENTER K (ZMW)", "AMOUNT: " + String((int)amountZmw));
+        // PIMISHA Backspace - handle decimals properly
+        if (decimalPlaces > 0) {
+          // Remove last decimal digit
+          decimalPlaces--;
+          float multiplier = pow(10.0f, decimalPlaces);
+          amountZmw = floor(amountZmw * multiplier) / multiplier;
+          if (decimalPlaces == 0) {
+            decimalEntered = false;  // No more decimals, allow new decimal
+          }
+        } else if (decimalEntered) {
+          // Just entered decimal point, remove it
+          decimalEntered = false;
+        } else {
+          // Remove last whole digit
+          amountZmw = (int)(amountZmw / 10);
+        }
+        // Update display with or without decimals
+        if (decimalEntered || decimalPlaces > 0) {
+          char buf[16];
+          snprintf(buf, sizeof(buf), "ENTER K: %.2f", amountZmw);
+          lcdShow("CUSTOM AMOUNT", buf);
+        } else {
+          lcdShow("CUSTOM AMOUNT", "ENTER K: " + String((int)amountZmw));
+        }
       }
       break;
 
@@ -2113,31 +2467,65 @@ void processKeyInput(char k) {
       if (k == 'B') {
         Serial.println("[DISPENSE] ==============================");
         Serial.println("[DISPENSE] START DISPENSING");
-        Serial.printf("[DISPENSE] targetLiters=%.4f\n", targetLiters);
-        Serial.printf("[DISPENSE] pricePerMl=%.4f\n", pricePerMl);
+        Serial.printf("[DISPENSE] transactionType=%s\n", transactionType.c_str());
+        if (transactionType == "PRESET") {
+          Serial.printf("[DISPENSE] presetLabel=%s\n", presetLabel.c_str());
+        }
+        
+        // Enforce calibration for accurate dispensing
+        if (!isCalibrated) {
+          Serial.println("[DISPENSE] Calibration required - blocking dispense");
+          lcdShow("CAL REQUIRED", "ADMIN -> 4");
+          state = ST_LOGIN_CODE;
+          inputBuf = "";
+          amountZmw = 0;
+          pendingTargetMl = 0;
+          targetLiters = 0;
+          break;
+        }
+
+        // PIMISHA: Calculate target ml using integer math
+        int targetMl = pendingTargetMl;
+        Serial.printf("[DISPENSE] targetMl=%d\n", targetMl);
         Serial.printf("[DISPENSE] amountZmw=%.2f\n", amountZmw);
         
-        if (targetLiters <= 0) {
-          Serial.println("[DISPENSE] ERROR: targetLiters <= 0, aborting!");
+        if (targetMl <= 0) {
+          Serial.println("[DISPENSE] ERROR: targetMl <= 0, aborting!");
           lcdShow("ERROR", "INVALID TARGET");
           delay(1500);
-          state = ST_AMOUNT;
+          state = ST_PRESET;
           amountZmw = 0;
-          lcdShow("ENTER AMOUNT", "K 0");
+          pendingTargetMl = 0;
+          lcdShow("PRESETS", "1:K5 2:K10 A=AMT");
           break;
         }
         
         dispensedLiters = 0;
         flowPulses = 0;
         lastPulse = 0;
-        // Lock price and session details at start of dispense
-        sessionPricePerMl = pricePerMl;
-        sessionTargetLiters = targetLiters;
+        
+        // PIMISHA: Lock session values at dispense start
+        sessionPricePerMl = PRICE_PER_ML;  // Always use LOCAL price
+        sessionTargetMl = targetMl;
+        sessionTargetLiters = (float)sessionTargetMl / 1000.0f;
+        sessionPulsesPerLiter = pulsesPerLiter;
+        
+        // PIMISHA: Calculate target pulses with ceil() for accuracy
+        // targetPulses = ceil((targetMl / 1000.0) * pulsesPerLiter)
+        targetPulses = (uint32_t)ceil((targetMl / 1000.0f) * sessionPulsesPerLiter);
+        
         sessionStartMs = millis();
         sessionCounter++;
         currentSessionId = String(DEVICE_ID) + "-" + String(sessionStartMs) + "-" + String(sessionCounter);
         
         Serial.printf("[DISPENSE] sessionId=%s\n", currentSessionId.c_str());
+        Serial.printf("[DISPENSE] targetMl=%d, targetPulses=%lu, ppl=%.2f\\n\", targetMl, targetPulses, sessionPulsesPerLiter);
+        Serial.printf("[DISPENSE] isCalibrated=%s\n", isCalibrated ? "YES" : "NO - VOLUMES MAY BE WRONG!");
+        if (!isCalibrated) {
+          Serial.println("[DISPENSE] *** WARNING: Using default 450 pulses/L - RUN CALIBRATION! ***");
+          lcdShow("!NOT CALIBRATED!", "VOLUMES WRONG");
+          delay(1500);
+        }
         Serial.println("[DISPENSE] Activating pump...");
         
         pumpOn();  // START PUMP
@@ -2149,10 +2537,10 @@ void processKeyInput(char k) {
         lcdShow("DISPENSING", "0 ml");
       }
       else if (k == 'C') {
-        // Cancel back to amount entry (keep value)
+        // Cancel back to preset menu
         amountZmw = 0;
-        state = ST_AMOUNT;
-        lcdShow("ENTER K (ZMW)", "AMOUNT: 0");
+        state = ST_PRESET;
+        lcdShow("PRESETS", "1:K5 2:K10 A=AMT");
       }
       break;
 
@@ -2201,17 +2589,22 @@ void processKeyInput(char k) {
           Serial.println("[DISPENSE] Cancelled by user");
           pumpOff();  // Stop pump on user cancel
           ledsError();
-          float mlDone = dispensedLiters * 1000.0f;
-          float targetMl = targetLiters * 1000.0f;
+          uint32_t currentPulses;
+          noInterrupts(); currentPulses = flowPulses; interrupts();
+          float mlDone = (currentPulses * 1000.0f) / sessionPulsesPerLiter;
+          float targetMl = (float)sessionTargetMl;
           if (mlDone > 0) {
-            sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS, "CANCELED");
+            sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, sessionPulsesPerLiter, STOP_MARGIN_LITERS, "CANCELED");
           }
           float actualPaid = mlDone * sessionPricePerMl;
           lcdShow("CANCELLED", String((int)mlDone) + "ml K" + String((int)actualPaid));
           delay(1500);
-          state = ST_MENU;
+          state = ST_LOGIN_CODE;
           scrollPos = 0;
           amountZmw = 0;
+          targetLiters = 0;
+          pendingTargetMl = 0;
+          sessionTargetMl = 0;
         }
       }
       break;
@@ -2286,9 +2679,13 @@ void processKeyInput(char k) {
         lcdShow("ADMIN MENU", "5=SYNC 4=CAL");
       }
       else if (k == 'A') {
-        // Go to dispense menu
-        state = ST_MENU;
-        scrollPos = 0;
+        // Go to preset menu for dispensing
+        state = ST_PRESET;
+        amountZmw = 0;
+        transactionType = "CUSTOM";
+        presetLabel = "";
+        selectedPresetIdx = -1;
+        lcdShow("PRESETS", "1:K5 2:K10 A=AMT");
       }
       else if (k == 'C') {
         // Logout
