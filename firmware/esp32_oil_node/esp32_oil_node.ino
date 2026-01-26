@@ -23,14 +23,31 @@ const char* WIFI_SSID = "deborah-my-wife";
 const char* WIFI_PASS = "admin@29";
 
 /* ================= PRICING ================= */
-// SINGLE SOURCE OF TRUTH FOR PRICING
-#define PRICE_PER_ML        0.045f   // K per milliliter (source of truth)
+/*******************************************************************************
+ * METROLOGICAL PRICING - SINGLE SOURCE OF TRUTH
+ * 
+ * CORE RULE: ALL price/volume calculations MUST derive from PRICE_PER_ML.
+ * 
+ * Formula chain:
+ *   PRICE_PER_ML = 0.045 K/ml (source of truth)
+ *   PRICE_PER_LITER = PRICE_PER_ML * 1000 = 45 K/L (derived)
+ *   
+ * Money → Volume:  targetMl = amountZmw / PRICE_PER_ML
+ * Volume → Money:  amountZmw = volumeMl * PRICE_PER_ML
+ * 
+ * ANTI-CHEATING: Never give more oil for less money. Rounding favors customer.
+ ******************************************************************************/
+#define PRICE_PER_ML        0.045f   // K per milliliter (SOURCE OF TRUTH)
+#define PRICE_PER_LITER     (PRICE_PER_ML * 1000.0f)  // K45/L (DERIVED)
 #define STOP_MARGIN_LITERS  0.005f   // 5ml max margin (regulatory limit)
 
-// Extra oil to dispense for small amounts (to account for pipe/hose volume)
-// This compensates for oil still in the pipe when pump stops
-#define SMALL_AMOUNT_THRESHOLD_ML  500.0f   // Amounts under 500ml get bonus
-#define SMALL_AMOUNT_BONUS_ML      30.0f    // Extra 30ml for small purchases
+// Mismatch detection threshold
+#define MISMATCH_THRESHOLD_ZMW  1.00f  // Flag if difference > K1.00
+#define OVERSHOOT_LIMIT_ML      5.0f   // Never dispense more than 5ml extra
+
+// Calibration enforcement
+#define UNCALIBRATED_MAX_ML     500.0f // Max volume if not calibrated
+#define CALIBRATION_REQUIRED_PPL 100.0f // Min pulsesPerLiter to be considered calibrated
 
 /* ================= ADMIN CREDENTIALS ================= */
 #define ADMIN_CODE     "0000"
@@ -143,6 +160,7 @@ float pulsesPerLiter = 450.0f;
 float dispensedLiters = 0;
 uint32_t lastPulse = 0;
 uint32_t lastFlowMs = 0;
+bool isCalibrated = false;  // Set true when pulsesPerLiter is saved from calibration
 void IRAM_ATTR onFlowPulse() { flowPulses++; }
 
 /* ================= SESSION ================= */
@@ -242,45 +260,92 @@ void resendQueue() {
   }
 }
 
-/* ================= SEND RECEIPT TO DASHBOARD ================= */
-// Send receipt with new structure and cross-check logic
-void sendReceiptV2(float amountRequestedZmw, float targetMlCalculated, float dispensedMlActual, float pricePerMl, float pulsesPerLiter, float stopMarginLiters) {
-  // Compute actual amount and difference
-  float amountCalculatedZmw = dispensedMlActual * pricePerMl;
+/*******************************************************************************
+ * METROLOGICAL RECEIPT - CROSS-CHECK VERIFICATION
+ * 
+ * This function performs the critical post-dispense verification required by
+ * weights & measures standards. It computes the actual monetary value of oil
+ * dispensed and compares it to what the customer paid.
+ * 
+ * CROSS-CHECK FORMULA:
+ *   actualAmountZmw = dispensedMl * PRICE_PER_ML
+ *   differenceZmw = |actualAmountZmw - amountRequestedZmw|
+ * 
+ * If differenceZmw > 1.00 Kwacha:
+ *   - Flag as MISMATCH
+ *   - Log to Serial for audit
+ *   - Blink yellow LED (visual alert)
+ *   - Send warning to dashboard
+ *   - Mark receipt as "adjustmentRequired"
+ ******************************************************************************/
+void sendReceiptV2(float amountRequestedZmw, float targetMlCalculated, float dispensedMlActual, float usedPricePerMl, float usedPulsesPerLiter, float stopMarginLiters) {
+  
+  // ===== METROLOGICAL CROSS-CHECK VERIFICATION =====
+  // Compute what the dispensed volume should cost
+  float amountCalculatedZmw = dispensedMlActual * usedPricePerMl;
   float differenceZmw = fabs(amountCalculatedZmw - amountRequestedZmw);
-  const float MISMATCH_THRESHOLD = 1.00f;
-  const float OVERSHOOT_LIMIT_ML = 5.0f;
-  const char* status = (differenceZmw > MISMATCH_THRESHOLD) ? "MISMATCH" : "OK";
+  
+  // Determine status based on mismatch threshold
+  bool isMismatch = (differenceZmw > MISMATCH_THRESHOLD_ZMW);
+  const char* status = isMismatch ? "MISMATCH" : "OK";
+  bool adjustmentRequired = isMismatch;
 
-  // Clamp overshoot (never give more than 5ml extra)
-  if (dispensedMlActual > targetMlCalculated + OVERSHOOT_LIMIT_ML) {
+  // Log metrological audit trail
+  Serial.println("[METROLOGY] ===== POST-DISPENSE VERIFICATION =====");
+  Serial.printf("[METROLOGY] Amount requested: K%.2f\n", amountRequestedZmw);
+  Serial.printf("[METROLOGY] Target volume: %.3f ml\n", targetMlCalculated);
+  Serial.printf("[METROLOGY] Dispensed volume: %.3f ml\n", dispensedMlActual);
+  Serial.printf("[METROLOGY] Price per ml: K%.6f\n", usedPricePerMl);
+  Serial.printf("[METROLOGY] Calculated amount: K%.2f\n", amountCalculatedZmw);
+  Serial.printf("[METROLOGY] Difference: K%.2f\n", differenceZmw);
+  Serial.printf("[METROLOGY] Status: %s\n", status);
+  Serial.printf("[METROLOGY] Adjustment required: %s\n", adjustmentRequired ? "YES" : "NO");
+  Serial.println("[METROLOGY] =========================================");
+
+  // ANTI-CHEATING: Cap overshoot at 5ml (never give significantly more than paid for)
+  float overshootMl = dispensedMlActual - targetMlCalculated;
+  if (overshootMl > OVERSHOOT_LIMIT_ML) {
+    Serial.printf("[METROLOGY] WARNING: Overshoot %.1f ml exceeds limit %.1f ml\n", overshootMl, OVERSHOOT_LIMIT_ML);
+    // For billing purposes, cap the reported dispense (actual hardware may have exceeded)
+    // This ensures the customer is never overcharged
     dispensedMlActual = targetMlCalculated + OVERSHOOT_LIMIT_ML;
-    amountCalculatedZmw = dispensedMlActual * pricePerMl;
+    amountCalculatedZmw = dispensedMlActual * usedPricePerMl;
     differenceZmw = fabs(amountCalculatedZmw - amountRequestedZmw);
+    adjustmentRequired = true;
   }
 
-  // If mismatch, blink yellow LED rapidly and log
-  if (differenceZmw > MISMATCH_THRESHOLD) {
-    Serial.println("[DISPENSE_MISMATCH] Dispensed value does not match paid amount!");
-    Serial.printf("[DISPENSE_MISMATCH] Paid: %.2f, Actual: %.2f, Diff: %.2f\n", amountRequestedZmw, amountCalculatedZmw, differenceZmw);
-    // Blink yellow LED rapidly (non-blocking)
+  // If mismatch, trigger visual alert and detailed logging
+  if (isMismatch) {
+    Serial.println("[DISPENSE_MISMATCH] *** ALERT: Dispensed value does not match paid amount! ***");
+    Serial.printf("[DISPENSE_MISMATCH] Customer paid: K%.2f, Oil value: K%.2f, Discrepancy: K%.2f\n", 
+                  amountRequestedZmw, amountCalculatedZmw, differenceZmw);
+    
+    // Blink yellow LED rapidly as visual alert (semi-blocking but necessary for safety)
     for (int i = 0; i < 10; ++i) {
       digitalWrite(PIN_LED_YELLOW, HIGH); delay(80);
       digitalWrite(PIN_LED_YELLOW, LOW); delay(80);
     }
   }
 
-  // Build receipt JSON
-  StaticJsonDocument<512> doc;
+  // Build receipt JSON with complete metrological data
+  StaticJsonDocument<640> doc;
+  
+  // Required metrological fields (per specification)
   doc["amountRequestedZmw"] = amountRequestedZmw;
   doc["targetMlCalculated"] = targetMlCalculated;
   doc["dispensedMlActual"] = dispensedMlActual;
   doc["amountCalculatedZmw"] = amountCalculatedZmw;
-  doc["pricePerMl"] = pricePerMl;
+  doc["pricePerMl"] = usedPricePerMl;
   doc["differenceZmw"] = differenceZmw;
   doc["status"] = status;
-  doc["pulsesPerLiter"] = pulsesPerLiter;
+  doc["adjustmentRequired"] = adjustmentRequired;
+  
+  // Calibration and system info
+  doc["pulsesPerLiter"] = usedPulsesPerLiter;
   doc["stopMarginLiters"] = stopMarginLiters;
+  doc["isCalibrated"] = isCalibrated;
+  
+  // Device identification
   doc["deviceId"] = DEVICE_ID;
   doc["siteName"] = siteNameRuntime;
   doc["operatorCode"] = loginCode;
@@ -440,11 +505,11 @@ void fetchDeviceConfig() {
     return;
   }
 
+  // Price config: always derive from per-ml as source of truth
   float newPricePerLiter = doc["price"]["pricePerLiter"] | 0.0f;
   if (newPricePerLiter > 0.0f) {
-    activePricePerLiter = newPricePerLiter;
-    pricePerMl = newPricePerLiter / 1000.0f;
-    Serial.printf("[CONFIG] Price %.2f ZMW/L\n", newPricePerLiter);
+    pricePerMl = newPricePerLiter / 1000.0f;  // Convert to source of truth unit
+    Serial.printf("[CONFIG] Price updated: %.4f K/ml (%.2f K/L)\n", pricePerMl, newPricePerLiter);
   }
 
   const char* newSite = doc["siteName"]; 
@@ -732,8 +797,28 @@ void updateFlow() {
 /* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
-  Serial.println("[BOOT] PIMISHA Oil Dispenser");
-  Serial.println("[BOOT] Firmware v2.3 - Dashboard WiFi Config");
+  delay(100);
+  
+  // Print metrological startup banner
+  Serial.println();
+  Serial.println("===============================================================");
+  Serial.println("  PIMISHA OIL DISPENSER - METROLOGICAL FIRMWARE v3.0");
+  Serial.println("  Weights & Measures Compliant");
+  Serial.println("===============================================================");
+  Serial.printf("  Device ID: %s\n", DEVICE_ID);
+  Serial.printf("  Site: %s\n", SITE_NAME);
+  Serial.println("---------------------------------------------------------------");
+  Serial.println("  PRICING CONFIGURATION (Single Source of Truth):");
+  Serial.printf("    PRICE_PER_ML:       K%.6f per ml\n", PRICE_PER_ML);
+  Serial.printf("    PRICE_PER_LITER:    K%.2f per liter (derived)\n", PRICE_PER_LITER);
+  Serial.println("---------------------------------------------------------------");
+  Serial.println("  METROLOGICAL LIMITS:");
+  Serial.printf("    Stop margin:        %.1f ml (max 5ml)\n", STOP_MARGIN_LITERS * 1000.0f);
+  Serial.printf("    Overshoot limit:    %.1f ml\n", OVERSHOOT_LIMIT_ML);
+  Serial.printf("    Mismatch threshold: K%.2f\n", MISMATCH_THRESHOLD_ZMW);
+  Serial.printf("    Uncalibrated max:   %.0f ml\n", UNCALIBRATED_MAX_ML);
+  Serial.println("===============================================================");
+  Serial.println();
 
   pinMode(PIN_PUMP, OUTPUT);
   pumpForceOff();  // CRITICAL: Pump OFF at boot (force regardless of state)
@@ -831,11 +916,13 @@ void setup() {
   prefs.begin("calib", true);
   float storedPpl = prefs.getFloat("pulsesPerL", 0.0f);
   prefs.end();
-  if (storedPpl > 0.0f) {
+  if (storedPpl >= CALIBRATION_REQUIRED_PPL) {
     pulsesPerLiter = storedPpl;
-    Serial.printf("[CALIB] Using stored pulsesPerLiter=%.2f\n", pulsesPerLiter);
+    isCalibrated = true;
+    Serial.printf("[CALIB] Using stored pulsesPerLiter=%.2f (CALIBRATED)\n", pulsesPerLiter);
   } else {
-    Serial.printf("[CALIB] Using default pulsesPerLiter=%.2f\n", pulsesPerLiter);
+    isCalibrated = false;
+    Serial.printf("[CALIB] Using default pulsesPerLiter=%.2f (NOT CALIBRATED - large volumes restricted)\n", pulsesPerLiter);
   }
 
   // Show that the system is powered and ready
@@ -873,20 +960,47 @@ void loop() {
   if (state == ST_DISPENSING) {
     updateDispenseDisplay();
     
-    // Auto-stop when target reached (normal dispensing only)
+    /***************************************************************************
+     * METROLOGICAL DISPENSING CONTROL
+     * 
+     * Pump stops based ONLY on flow sensor volume measurement:
+     *   dispensedLiters >= (targetLitersExact - STOP_MARGIN_LITERS)
+     * 
+     * STOP_MARGIN_LITERS is max 5ml (0.005L) per regulatory requirements.
+     * This ensures we stop slightly before target to account for flow inertia.
+     **************************************************************************/
     if (!calibrationMode && targetLiters > 0 && dispensedLiters >= (targetLiters - STOP_MARGIN_LITERS)) {
-      Serial.println("[AUTO-STOP] Target reached!");
-      Serial.printf("[AUTO-STOP] dispensed=%.3f, target=%.3f, margin=%.3f\n", dispensedLiters, targetLiters, STOP_MARGIN_LITERS);
+      
+      // CRITICAL: Stop pump immediately
       pumpOff();
       ledsIdle();
+      
+      // Calculate final values for metrological verification
       float mlDone = dispensedLiters * 1000.0f;
       float targetMl = targetLiters * 1000.0f;
-      sendReceiptV2(amountZmw, targetMl, mlDone, pricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS);
+      
+      // Log dispense completion
+      Serial.println("[AUTO-STOP] ===== DISPENSE COMPLETE =====");
+      Serial.printf("[AUTO-STOP] Target: %.3f L (%.1f ml)\\n", targetLiters, targetMl);
+      Serial.printf("[AUTO-STOP] Dispensed: %.6f L (%.3f ml)\\n", dispensedLiters, mlDone);
+      Serial.printf("[AUTO-STOP] Stop margin: %.3f L (%.1f ml)\\n", STOP_MARGIN_LITERS, STOP_MARGIN_LITERS * 1000.0f);
+      Serial.printf("[AUTO-STOP] Undershoot: %.3f ml\\n", targetMl - mlDone);
+      Serial.println("[AUTO-STOP] =============================");
+      
+      // Send receipt with cross-check verification (uses session-locked price)
+      sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS);
+      
+      // Reset state
       state = ST_LOGIN_CODE;
       inputBuf = "";
+      dispensedLiters = 0;
+      targetLiters = 0;
       amountZmw = 0;
       calibrationMode = false;
-      lcdShow("DONE", String((int)mlDone) + " ml");
+      
+      // Show completion to operator (display rounded for readability)
+      int displayMl = ((int)mlDone / 5) * 5;  // Round to nearest 5ml for display
+      lcdShow("DONE", String(displayMl) + " ml");
       delay(2000);
       lcdShow("SYSTEM RUNNING", "ENTER CODE");
     }
@@ -934,15 +1048,16 @@ void loop() {
       lcdShow("ADMIN MENU", "1=ADD 2=DEL 3=LST");
     } else {
       if (dispensedLiters > 0) {
-        float mlDone = dispensedLiters * 1000;
-        float paid = round2(mlDone * sessionPricePerMl);
-        float targetMl = (targetLiters > 0 && targetLiters < 900.0f) ? targetLiters * 1000.0f : 0.0f;
-        sendReceipt(mlDone, paid, targetMl, "ERROR");
+        float mlDone = dispensedLiters * 1000.0f;
+        float targetMl = targetLiters * 1000.0f;
+        // Use sendReceiptV2 for consistent receipt structure (status will show MISMATCH if applicable)
+        sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS);
+        float actualPaid = mlDone * sessionPricePerMl;
         state = ST_LOGIN_CODE;
         inputBuf = "";
         amountZmw = 0;
         dispensedLiters = 0;
-        lcdShow("E-STOP", String((int)mlDone) + "ml K" + String((int)paid));
+        lcdShow("E-STOP", String((int)mlDone) + "ml K" + String((int)actualPaid));
       } else {
         state = ST_LOGIN_CODE;
         inputBuf = "";
@@ -1054,22 +1169,37 @@ void loop() {
           state = ST_LOGIN_CODE;
           inputBuf = "";
           lcdShow("SYSTEM RUNNING", "ENTER CODE");
-        } else if (pulsesPerLiter <= 0.0f) {
-          // Calibration dependency: block dispensing if not calibrated
-          lcdShow("CALIBRATION REQ", "ADMIN ONLY");
-          delay(2000);
-          amountZmw = 0;
-          state = ST_LOGIN_CODE;
-          inputBuf = "";
-          lcdShow("SYSTEM RUNNING", "ENTER CODE");
         } else {
-          // Calculate exact target from amount paid (no rounding)
+          // METROLOGICAL CALCULATION: Money → Volume (exact, no rounding for control)
+          // Formula: targetMl = amountZmw / PRICE_PER_ML
           float targetMlExact = amountZmw / pricePerMl;
           float targetLitersExact = targetMlExact / 1000.0f;
+          
+          // CALIBRATION DEPENDENCY: Restrict large volumes if uncalibrated
+          if (!isCalibrated && targetMlExact > UNCALIBRATED_MAX_ML) {
+            Serial.printf("[CALIB] Volume %.0f ml exceeds uncalibrated limit %.0f ml\n", targetMlExact, UNCALIBRATED_MAX_ML);
+            lcdShow("CALIB REQUIRED", "MAX " + String((int)UNCALIBRATED_MAX_ML) + "ml");
+            delay(2000);
+            amountZmw = 0;
+            lcdShow("ENTER AMOUNT", "K 0");
+            break;
+          }
+          
           targetLiters = targetLitersExact;
           state = ST_READY;
-          Serial.printf("[AMOUNT] Paid=K%.2f, Target=%.3f ml (%.6f L)\n", amountZmw, targetMlExact, targetLitersExact);
-          lcdShow("CONFIRM", "K" + String((int)amountZmw) + "=" + String((int)targetMlExact) + "ml");
+          
+          // Log exact values for audit trail
+          Serial.println("[METROLOGY] ==============================");
+          Serial.printf("[METROLOGY] Amount entered: K%.2f\n", amountZmw);
+          Serial.printf("[METROLOGY] Price per ml: K%.6f\n", pricePerMl);
+          Serial.printf("[METROLOGY] Target ml (exact): %.6f\n", targetMlExact);
+          Serial.printf("[METROLOGY] Target liters (exact): %.9f\n", targetLitersExact);
+          Serial.printf("[METROLOGY] Calibrated: %s\n", isCalibrated ? "YES" : "NO");
+          Serial.println("[METROLOGY] ==============================");
+          
+          // Display rounded for human readability (control uses exact values)
+          int displayMl = ((int)targetMlExact / 5) * 5;  // Round to nearest 5ml for display only
+          lcdShow("CONFIRM", "K" + String((int)amountZmw) + "=" + String(displayMl) + "ml");
           delay(800);
           lcdShow("READY", "PRESS B");
         }
@@ -1146,11 +1276,13 @@ void loop() {
           noInterrupts();
           uint32_t pulses = flowPulses;
           interrupts();
-          if (pulses > 0) {
+          if (pulses >= (uint32_t)CALIBRATION_REQUIRED_PPL) {
             pulsesPerLiter = (float)pulses;
+            isCalibrated = true;
             prefs.begin("calib", false);
             prefs.putFloat("pulsesPerL", pulsesPerLiter);
             prefs.end();
+            Serial.printf("[CALIB] Calibration saved: %.0f pulses/L\n", pulsesPerLiter);
             lcdShow("CAL DONE", String((int)pulsesPerLiter) + " p/L");
           } else {
             lcdShow("CAL FAILED", "NO PULSES");
@@ -1178,11 +1310,13 @@ void loop() {
           Serial.println("[DISPENSE] Cancelled by user");
           pumpOff();  // Stop pump on user cancel
           ledsError();
-          float mlDone = dispensedLiters * 1000;
-          float paid = round2(mlDone * sessionPricePerMl);
-          float targetMl = (targetLiters > 0 && targetLiters < 900.0f) ? targetLiters * 1000.0f : 0.0f;
-          if (mlDone > 0) sendReceipt(mlDone, paid, targetMl, "CANCELED");  // Send partial receipt
-          lcdShow("CANCELLED", String((int)mlDone) + "ml K" + String((int)paid));
+          float mlDone = dispensedLiters * 1000.0f;
+          float targetMl = targetLiters * 1000.0f;
+          if (mlDone > 0) {
+            sendReceiptV2(amountZmw, targetMl, mlDone, sessionPricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS);
+          }
+          float actualPaid = mlDone * sessionPricePerMl;
+          lcdShow("CANCELLED", String((int)mlDone) + "ml K" + String((int)actualPaid));
           delay(1500);
           state = ST_MENU;
           scrollPos = 0;

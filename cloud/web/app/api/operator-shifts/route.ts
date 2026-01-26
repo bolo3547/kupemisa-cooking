@@ -45,7 +45,7 @@ export async function GET(req: NextRequest) {
   });
 
   // Get operator names
-  const operatorIds = [...new Set(shifts.map(s => s.operatorId))];
+  const operatorIds = Array.from(new Set(shifts.map(s => s.operatorId)));
   const operators = await prisma.operator.findMany({
     where: { id: { in: operatorIds } },
     select: { id: true, name: true },
