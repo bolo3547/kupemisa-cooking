@@ -102,7 +102,7 @@ export async function POST(request: NextRequest) {
 
     if (!operator) {
       // Log failed attempt
-      console.log(`[PIN] Failed verification attempt on device ${deviceId}`);
+      console.log(`[PIN] Failed verification attempt on device ${authResult.device.deviceId}`);
       
       return NextResponse.json({
         ok: false,
@@ -111,7 +111,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Log successful verification
-    console.log(`[PIN] Operator ${operator.name} verified on device ${deviceId}`);
+    console.log(`[PIN] Operator ${operator.name} verified on device ${authResult.device.deviceId}`);
 
     return NextResponse.json({
       ok: true,
