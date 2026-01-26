@@ -5,6 +5,9 @@ import { getSession } from '@/lib/auth';
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
+// Device is considered offline if not seen in 2 minutes
+const OFFLINE_THRESHOLD_MS = 2 * 60 * 1000;
+
 export async function GET() {
   try {
     const session = await getSession();
@@ -39,17 +42,30 @@ export async function GET() {
       },
     });
 
+    const now = Date.now();
+
     // Transform the data for the frontend
-    const result = devices.map((device) => ({
-      ...device,
-      latestTelemetry: device.telemetry[0]
-        ? {
-            ...device.telemetry[0],
-            ts: Number(device.telemetry[0].ts),
-          }
-        : null,
-      telemetry: undefined,
-    }));
+    const result = devices.map((device) => {
+      // Determine if device is online based on lastSeenAt
+      const lastSeen = device.lastSeenAt ? new Date(device.lastSeenAt).getTime() : 0;
+      const isOnline = (now - lastSeen) < OFFLINE_THRESHOLD_MS;
+      
+      // Override status to OFFLINE if not seen recently
+      const effectiveStatus = isOnline ? device.status : 'OFFLINE';
+      
+      return {
+        ...device,
+        status: effectiveStatus,
+        isOnline,
+        latestTelemetry: device.telemetry[0]
+          ? {
+              ...device.telemetry[0],
+              ts: Number(device.telemetry[0].ts),
+            }
+          : null,
+        telemetry: undefined,
+      };
+    });
 
     return NextResponse.json(result);
   } catch (error) {

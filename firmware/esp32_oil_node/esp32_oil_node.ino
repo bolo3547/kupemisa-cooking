@@ -1174,27 +1174,65 @@ void syncUserToDashboard(const String& code, const String& pin, Role role, bool 
 }
 
 bool addUser(const String& code, const String& pin, Role role) {
-  prefs.begin("users", false);
-  int count = prefs.getInt("count", 0);
-  if (count >= MAX_USERS) {
-    prefs.end();
-    return false;
-  }
-  // Check if code already exists
-  for (int i = 0; i < count; i++) {
-    String existingCode = prefs.getString(("c" + String(i)).c_str(), "");
-    if (existingCode == code) {
+  // First, add to operators cache so they can login immediately
+  // This mirrors the format used by dashboard-synced operators
+  String pinHash = hashPinForDevice(pin);
+  String roleStr = (role == SUPERVISOR) ? "SUPERVISOR" : "OPERATOR";
+  String opId = "LOCAL-" + code;  // Local operators get LOCAL- prefix
+  
+  prefs.begin("operators", false);
+  int opCount = prefs.getInt("count", 0);
+  
+  // Check if PIN already exists in operator cache
+  for (int i = 0; i < opCount; i++) {
+    String existingHash = prefs.getString(("ph" + String(i)).c_str(), "");
+    if (existingHash == pinHash) {
       prefs.end();
-      return false;  // Code already exists
+      Serial.println("[USER] PIN already in use!");
+      return false;
     }
   }
-  // Store new user
-  prefs.putString(("c" + String(count)).c_str(), code);
-  prefs.putString(("p" + String(count)).c_str(), pin);
-  prefs.putInt(("r" + String(count)).c_str(), (int)role);
-  prefs.putInt("count", count + 1);
+  
+  // Check if operator name already exists
+  for (int i = 0; i < opCount; i++) {
+    String existingName = prefs.getString(("nm" + String(i)).c_str(), "");
+    if (existingName == code) {
+      // Update existing operator's PIN and role
+      prefs.putString(("ph" + String(i)).c_str(), pinHash);
+      prefs.putString(("rl" + String(i)).c_str(), roleStr);
+      prefs.end();
+      Serial.printf("[USER] Updated existing: %s role=%s\n", code.c_str(), roleStr.c_str());
+      syncUserToDashboard(code, pin, role, false);
+      return true;
+    }
+  }
+  
+  // Add new operator to cache
+  if (opCount >= 20) {  // Max 20 operators in cache
+    prefs.end();
+    Serial.println("[USER] Operator cache full!");
+    return false;
+  }
+  
+  prefs.putString(("id" + String(opCount)).c_str(), opId);
+  prefs.putString(("nm" + String(opCount)).c_str(), code);
+  prefs.putString(("ph" + String(opCount)).c_str(), pinHash);
+  prefs.putString(("rl" + String(opCount)).c_str(), roleStr);
+  prefs.putInt("count", opCount + 1);
   prefs.end();
-  Serial.printf("[USER] Added: %s role=%d\n", code.c_str(), role);
+  
+  Serial.printf("[USER] Added to operator cache: %s role=%s\n", code.c_str(), roleStr.c_str());
+  
+  // Also keep in legacy users storage for backward compatibility
+  prefs.begin("users", false);
+  int count = prefs.getInt("count", 0);
+  if (count < MAX_USERS) {
+    prefs.putString(("c" + String(count)).c_str(), code);
+    prefs.putString(("p" + String(count)).c_str(), pin);
+    prefs.putInt(("r" + String(count)).c_str(), (int)role);
+    prefs.putInt("count", count + 1);
+  }
+  prefs.end();
   
   // Sync to dashboard
   syncUserToDashboard(code, pin, role, false);
@@ -1203,29 +1241,70 @@ bool addUser(const String& code, const String& pin, Role role) {
 }
 
 bool deleteUser(const String& code) {
-  prefs.begin("users", false);
-  int count = prefs.getInt("count", 0);
-  int foundIdx = -1;
   Role deletedRole = OPERATOR;
-  for (int i = 0; i < count; i++) {
-    if (prefs.getString(("c" + String(i)).c_str(), "") == code) {
-      foundIdx = i;
-      deletedRole = (Role)prefs.getInt(("r" + String(i)).c_str(), 0);
+  bool found = false;
+  
+  // Remove from operators cache (new system)
+  prefs.begin("operators", false);
+  int opCount = prefs.getInt("count", 0);
+  int opFoundIdx = -1;
+  
+  for (int i = 0; i < opCount; i++) {
+    String nm = prefs.getString(("nm" + String(i)).c_str(), "");
+    if (nm == code) {
+      opFoundIdx = i;
+      String roleStr = prefs.getString(("rl" + String(i)).c_str(), "OPERATOR");
+      deletedRole = (roleStr == "SUPERVISOR") ? SUPERVISOR : OPERATOR;
+      found = true;
       break;
     }
   }
-  if (foundIdx < 0) {
-    prefs.end();
+  
+  if (opFoundIdx >= 0) {
+    // Shift operators down
+    for (int i = opFoundIdx; i < opCount - 1; i++) {
+      prefs.putString(("id" + String(i)).c_str(), prefs.getString(("id" + String(i+1)).c_str(), ""));
+      prefs.putString(("nm" + String(i)).c_str(), prefs.getString(("nm" + String(i+1)).c_str(), ""));
+      prefs.putString(("ph" + String(i)).c_str(), prefs.getString(("ph" + String(i+1)).c_str(), ""));
+      prefs.putString(("rl" + String(i)).c_str(), prefs.getString(("rl" + String(i+1)).c_str(), ""));
+    }
+    prefs.putInt("count", opCount - 1);
+    Serial.printf("[USER] Removed from operator cache: %s\n", code.c_str());
+  }
+  prefs.end();
+  
+  // Also remove from legacy users storage
+  prefs.begin("users", false);
+  int count = prefs.getInt("count", 0);
+  int foundIdx = -1;
+  
+  for (int i = 0; i < count; i++) {
+    if (prefs.getString(("c" + String(i)).c_str(), "") == code) {
+      foundIdx = i;
+      if (!found) {
+        deletedRole = (Role)prefs.getInt(("r" + String(i)).c_str(), 0);
+      }
+      found = true;
+      break;
+    }
+  }
+  
+  if (foundIdx >= 0) {
+    // Shift all users down
+    for (int i = foundIdx; i < count - 1; i++) {
+      prefs.putString(("c" + String(i)).c_str(), prefs.getString(("c" + String(i+1)).c_str(), ""));
+      prefs.putString(("p" + String(i)).c_str(), prefs.getString(("p" + String(i+1)).c_str(), ""));
+      prefs.putInt(("r" + String(i)).c_str(), prefs.getInt(("r" + String(i+1)).c_str(), 0));
+    }
+    prefs.putInt("count", count - 1);
+    Serial.printf("[USER] Removed from legacy storage: %s\n", code.c_str());
+  }
+  prefs.end();
+  
+  if (!found) {
+    Serial.printf("[USER] Not found: %s\n", code.c_str());
     return false;
   }
-  // Shift all users down
-  for (int i = foundIdx; i < count - 1; i++) {
-    prefs.putString(("c" + String(i)).c_str(), prefs.getString(("c" + String(i+1)).c_str(), ""));
-    prefs.putString(("p" + String(i)).c_str(), prefs.getString(("p" + String(i+1)).c_str(), ""));
-    prefs.putInt(("r" + String(i)).c_str(), prefs.getInt(("r" + String(i+1)).c_str(), 0));
-  }
-  prefs.putInt("count", count - 1);
-  prefs.end();
   
   // Sync deletion to dashboard
   syncUserToDashboard(code, "", deletedRole, true);

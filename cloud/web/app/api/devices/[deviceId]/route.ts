@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { getSession } from '@/lib/auth';
 
+// Device is considered offline if not seen in 2 minutes
+const OFFLINE_THRESHOLD_MS = 2 * 60 * 1000;
+
 export async function GET(
   request: NextRequest,
   { params }: { params: { deviceId: string } }
@@ -44,9 +47,19 @@ export async function GET(
       return NextResponse.json({ error: 'Device not found' }, { status: 404 });
     }
 
+    // Determine if device is online based on lastSeenAt
+    const now = Date.now();
+    const lastSeen = device.lastSeenAt ? new Date(device.lastSeenAt).getTime() : 0;
+    const isOnline = (now - lastSeen) < OFFLINE_THRESHOLD_MS;
+    
+    // Override status to OFFLINE if not seen recently
+    const effectiveStatus = isOnline ? device.status : 'OFFLINE';
+
     // Transform BigInt to Number for JSON serialization
     const result = {
       ...device,
+      status: effectiveStatus,
+      isOnline,
       telemetry: device.telemetry.map((t) => ({
         ...t,
         ts: Number(t.ts),
