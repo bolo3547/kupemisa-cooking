@@ -375,7 +375,7 @@ export default function PerformancePage() {
               <strong>Current Rate:</strong> {(commissionRate * 100).toFixed(1)}% of total revenue
             </p>
             <p>
-              Commission is automatically calculated based on each operator's sales revenue. 
+              Commission is automatically calculated based on each operator&apos;s sales revenue. 
               Use this data for payroll or bonus calculations.
             </p>
             <p className="text-xs">
