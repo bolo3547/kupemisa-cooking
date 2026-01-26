@@ -287,7 +287,7 @@ export default function ProvisionPage() {
                       ESP32 Provisioning Portal (No Code Editing!)
                     </h4>
                     <p className="text-sm text-blue-800">
-                      Flash the firmware once, then configure via the device's built-in WiFi portal.
+                      Flash the firmware once, then configure via the device&apos;s built-in WiFi portal.
                     </p>
                   </div>
 

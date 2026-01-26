@@ -23,8 +23,9 @@ const char* WIFI_SSID = "deborah-my-wife";
 const char* WIFI_PASS = "admin@29";
 
 /* ================= PRICING ================= */
-#define PRICE_PER_ML        0.045f
-#define STOP_MARGIN_LITERS  0.002f   // 2ml margin (reduced for accuracy)
+// SINGLE SOURCE OF TRUTH FOR PRICING
+#define PRICE_PER_ML        0.045f   // K per milliliter (source of truth)
+#define STOP_MARGIN_LITERS  0.005f   // 5ml max margin (regulatory limit)
 
 // Extra oil to dispense for small amounts (to account for pipe/hose volume)
 // This compensates for oil still in the pipe when pump stops
@@ -180,9 +181,8 @@ String loginCode = "";
 float amountZmw = 0;
 float targetLiters = 0;
 
-// Dynamic pricing and configuration
-float pricePerMl = PRICE_PER_ML;
-float activePricePerLiter = PRICE_PER_ML * 1000.0f;
+// Dynamic pricing (always derive per-ml)
+float pricePerMl = PRICE_PER_ML; // Source of truth
 bool calibrationMode = false;
 unsigned long lastConfigFetchMs = 0;
 String siteNameRuntime = SITE_NAME;
@@ -243,68 +243,70 @@ void resendQueue() {
 }
 
 /* ================= SEND RECEIPT TO DASHBOARD ================= */
-void sendReceipt(float mlDispensed, float amountPaid, float targetMl, const char* status) {
-  // Compute timing based on synced Unix time if available
-  unsigned long nowMs = millis();
-  long long startedAtUnixSec;
-  long long endedAtUnixSec;
-  if (hasTimeSync) {
-    startedAtUnixSec = (unixTimeOffsetMs + (long long)sessionStartMs) / 1000LL;
-    endedAtUnixSec   = (unixTimeOffsetMs + (long long)nowMs) / 1000LL;
-  } else {
-    // Fallback: derive from millis (not real wall clock but monotonic)
-    startedAtUnixSec = (long long)sessionStartMs / 1000LL;
-    endedAtUnixSec   = (long long)nowMs / 1000LL;
+// Send receipt with new structure and cross-check logic
+void sendReceiptV2(float amountRequestedZmw, float targetMlCalculated, float dispensedMlActual, float pricePerMl, float pulsesPerLiter, float stopMarginLiters) {
+  // Compute actual amount and difference
+  float amountCalculatedZmw = dispensedMlActual * pricePerMl;
+  float differenceZmw = fabs(amountCalculatedZmw - amountRequestedZmw);
+  const float MISMATCH_THRESHOLD = 1.00f;
+  const float OVERSHOOT_LIMIT_ML = 5.0f;
+  const char* status = (differenceZmw > MISMATCH_THRESHOLD) ? "MISMATCH" : "OK";
+
+  // Clamp overshoot (never give more than 5ml extra)
+  if (dispensedMlActual > targetMlCalculated + OVERSHOOT_LIMIT_ML) {
+    dispensedMlActual = targetMlCalculated + OVERSHOOT_LIMIT_ML;
+    amountCalculatedZmw = dispensedMlActual * pricePerMl;
+    differenceZmw = fabs(amountCalculatedZmw - amountRequestedZmw);
   }
 
-  float dispLiters = mlDispensed / 1000.0f;
-  float tgtLiters  = (targetMl > 0.0f) ? (targetMl / 1000.0f) : sessionTargetLiters;
-  int durationSec  = (int)((nowMs - sessionStartMs) / 1000UL);
+  // If mismatch, blink yellow LED rapidly and log
+  if (differenceZmw > MISMATCH_THRESHOLD) {
+    Serial.println("[DISPENSE_MISMATCH] Dispensed value does not match paid amount!");
+    Serial.printf("[DISPENSE_MISMATCH] Paid: %.2f, Actual: %.2f, Diff: %.2f\n", amountRequestedZmw, amountCalculatedZmw, differenceZmw);
+    // Blink yellow LED rapidly (non-blocking)
+    for (int i = 0; i < 10; ++i) {
+      digitalWrite(PIN_LED_YELLOW, HIGH); delay(80);
+      digitalWrite(PIN_LED_YELLOW, LOW); delay(80);
+    }
+  }
 
+  // Build receipt JSON
   StaticJsonDocument<512> doc;
-  // New schema fields for /api/ingest/receipt
-  doc["sessionId"]      = currentSessionId;
-  doc["operatorPin"]    = lastLoginPin;  // backend matches this against pin hashes
-  doc["targetLiters"]   = tgtLiters;
-  doc["dispensedLiters"] = dispLiters;
-  doc["durationSec"]    = durationSec;
-  doc["status"]         = status;        // DONE | ERROR | CANCELED
-  doc["startedAtUnix"]  = startedAtUnixSec;
-  doc["endedAtUnix"]    = endedAtUnixSec;
-
-  // Backward/diagnostic fields (ignored by strict schema but useful for debugging)
-  doc["deviceId"]       = DEVICE_ID;
-  doc["siteName"]       = siteNameRuntime;
-  doc["operatorCode"]   = loginCode;
-  doc["volumeMl"]       = (int)mlDispensed;
-  doc["targetVolumeMl"] = (int)targetMl;
-  doc["amountZmw"]      = amountPaid;
-  doc["pricePerLiter"]  = activePricePerLiter;
-  doc["pricePerMl"]     = sessionPricePerMl;
+  doc["amountRequestedZmw"] = amountRequestedZmw;
+  doc["targetMlCalculated"] = targetMlCalculated;
+  doc["dispensedMlActual"] = dispensedMlActual;
+  doc["amountCalculatedZmw"] = amountCalculatedZmw;
+  doc["pricePerMl"] = pricePerMl;
+  doc["differenceZmw"] = differenceZmw;
+  doc["status"] = status;
   doc["pulsesPerLiter"] = pulsesPerLiter;
-  
+  doc["stopMarginLiters"] = stopMarginLiters;
+  doc["deviceId"] = DEVICE_ID;
+  doc["siteName"] = siteNameRuntime;
+  doc["operatorCode"] = loginCode;
+  doc["sessionId"] = currentSessionId;
+  doc["operatorPin"] = lastLoginPin;
+
   String body;
   serializeJson(doc, body);
-  
   Serial.println("[RECEIPT] " + body);
-  
+
   if (isOnline) {
     HTTPClient http;
     secureClient.setInsecure();
     http.begin(secureClient, String(API_BASE_URL) + "/api/ingest/receipt");
-    http.setTimeout(3000);  // 3 second timeout for responsiveness
+    http.setTimeout(3000);
     http.addHeader("Content-Type", "application/json");
     http.addHeader("x-device-id", DEVICE_ID);
     http.addHeader("x-api-key", API_KEY);
     int code = http.POST(body);
     Serial.printf("[HTTP] Receipt response: %d\n", code);
     http.end();
-    
     if (code < 200 || code >= 300) {
-      queueReceipt(body);  // Queue if failed
+      queueReceipt(body);
     }
   } else {
-    queueReceipt(body);  // Queue if offline
+    queueReceipt(body);
   }
 }
 
@@ -874,14 +876,12 @@ void loop() {
     // Auto-stop when target reached (normal dispensing only)
     if (!calibrationMode && targetLiters > 0 && dispensedLiters >= (targetLiters - STOP_MARGIN_LITERS)) {
       Serial.println("[AUTO-STOP] Target reached!");
-      Serial.printf("[AUTO-STOP] dispensed=%.3f, target=%.3f, margin=%.3f\n", 
-                    dispensedLiters, targetLiters, STOP_MARGIN_LITERS);
-      pumpOff();  // Target reached - stop pump
+      Serial.printf("[AUTO-STOP] dispensed=%.3f, target=%.3f, margin=%.3f\n", dispensedLiters, targetLiters, STOP_MARGIN_LITERS);
+      pumpOff();
       ledsIdle();
-      float mlDone = dispensedLiters * 1000;
-      float paid = round2(mlDone * sessionPricePerMl);
+      float mlDone = dispensedLiters * 1000.0f;
       float targetMl = targetLiters * 1000.0f;
-      sendReceipt(mlDone, paid, targetMl, "DONE");  // Send to dashboard
+      sendReceiptV2(amountZmw, targetMl, mlDone, pricePerMl, pulsesPerLiter, STOP_MARGIN_LITERS);
       state = ST_LOGIN_CODE;
       inputBuf = "";
       amountZmw = 0;
@@ -1054,24 +1054,22 @@ void loop() {
           state = ST_LOGIN_CODE;
           inputBuf = "";
           lcdShow("SYSTEM RUNNING", "ENTER CODE");
+        } else if (pulsesPerLiter <= 0.0f) {
+          // Calibration dependency: block dispensing if not calibrated
+          lcdShow("CALIBRATION REQ", "ADMIN ONLY");
+          delay(2000);
+          amountZmw = 0;
+          state = ST_LOGIN_CODE;
+          inputBuf = "";
+          lcdShow("SYSTEM RUNNING", "ENTER CODE");
         } else {
-          // Calculate base target from amount paid
-          float baseMl = (amountZmw / pricePerMl);
-          
-          // Add bonus for small amounts to compensate for pipe/hose volume
-          float bonusMl = 0;
-          if (baseMl < SMALL_AMOUNT_THRESHOLD_ML) {
-            bonusMl = SMALL_AMOUNT_BONUS_ML;
-            Serial.printf("[AMOUNT] Small amount bonus: +%.0f ml\n", bonusMl);
-          }
-          
-          targetLiters = (baseMl + bonusMl) / 1000.0f;
+          // Calculate exact target from amount paid (no rounding)
+          float targetMlExact = amountZmw / pricePerMl;
+          float targetLitersExact = targetMlExact / 1000.0f;
+          targetLiters = targetLitersExact;
           state = ST_READY;
-          float displayMl = baseMl;  // Show what they paid for
-          float actualMl = baseMl + bonusMl;  // What they'll actually get
-          Serial.printf("[AMOUNT] Paid=K%.0f, Base=%.0f ml, Bonus=%.0f ml, Target=%.0f ml\n", 
-                        amountZmw, baseMl, bonusMl, actualMl);
-          lcdShow("CONFIRM", "K" + String((int)amountZmw) + "=" + String((int)displayMl) + "ml");
+          Serial.printf("[AMOUNT] Paid=K%.2f, Target=%.3f ml (%.6f L)\n", amountZmw, targetMlExact, targetLitersExact);
+          lcdShow("CONFIRM", "K" + String((int)amountZmw) + "=" + String((int)targetMlExact) + "ml");
           delay(800);
           lcdShow("READY", "PRESS B");
         }
