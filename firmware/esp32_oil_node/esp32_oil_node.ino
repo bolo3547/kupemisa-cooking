@@ -117,10 +117,15 @@ static const int PIN_PUMP = 26;
 static const bool PUMP_ACTIVE_HIGH = true;
 
 // Flow sensor pulse input (interrupt)
-static const int PIN_FLOW = 27;
+static const int PIN_FLOW = 4;  // Changed from 27 (now used by keypad)
 
 // Tamper detection (cabinet open / wire cut)
 static const int PIN_TAMPER = 34;  // INPUT_ONLY pin (ADC1_CH6)
+
+// Status LEDs
+static const int PIN_LED_RED = 2;      // Error/Tamper (built-in LED on many boards)
+static const int PIN_LED_GREEN = 15;   // OK/Dispensing
+static const int PIN_LED_YELLOW = 32;  // Warning/Busy (safe for output)
 
 // I2C LCD pins (ESP32 default I2C)
 // SDA = GPIO 21
@@ -631,6 +636,52 @@ String scrollText(String text, int maxLen, int& pos) {
   if (pos >= text.length() + 3) pos = 0;
   
   return padded.substring(pos, pos + maxLen);
+}
+
+// ========================= LED STATUS FUNCTIONS =========================
+// LED Assignments:
+// - RED (GPIO 2)    = System Power: Always ON when system is running
+// - GREEN (GPIO 15) = Pump Status: ON when pump is active/dispensing
+// - YELLOW (GPIO 32)= WiFi Status: Blinking when connected, OFF when disconnected
+
+static uint32_t lastWifiBlinkMs = 0;
+static bool wifiLedState = false;
+
+void ledSystemOn() {
+  // Red LED = System power indicator (always ON when running)
+  digitalWrite(PIN_LED_RED, HIGH);
+}
+
+void ledPumpOn() {
+  // Green LED = Pump is active/dispensing
+  digitalWrite(PIN_LED_GREEN, HIGH);
+}
+
+void ledPumpOff() {
+  // Green LED = Pump is off
+  digitalWrite(PIN_LED_GREEN, LOW);
+}
+
+void ledWifiUpdate() {
+  // Yellow LED = WiFi status (blink when connected, OFF when disconnected)
+  if (isOnline) {
+    // Blink every 500ms when connected
+    if (millis() - lastWifiBlinkMs >= 500) {
+      lastWifiBlinkMs = millis();
+      wifiLedState = !wifiLedState;
+      digitalWrite(PIN_LED_YELLOW, wifiLedState ? HIGH : LOW);
+    }
+  } else {
+    // OFF when disconnected
+    digitalWrite(PIN_LED_YELLOW, LOW);
+    wifiLedState = false;
+  }
+}
+
+void ledAllOff() {
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_YELLOW, LOW);
 }
 
 // ========================= UI FUNCTIONS (16x2 LCD) =========================
@@ -1471,6 +1522,18 @@ void setup() {
   delay(50);
   pumpSet(false);  // Then set proper state
   
+  // Initialize LED pins
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_YELLOW, OUTPUT);
+  digitalWrite(PIN_LED_RED, HIGH);   // System LED ON (system is running)
+  digitalWrite(PIN_LED_GREEN, LOW);  // Pump LED OFF
+  digitalWrite(PIN_LED_YELLOW, LOW); // WiFi LED OFF (will blink when connected)
+  Serial.println("[LED] Status LEDs initialized:");
+  Serial.println("[LED]   RED (GPIO 2)    = System Power (ON)");
+  Serial.println("[LED]   GREEN (GPIO 15) = Pump Status (OFF)");
+  Serial.println("[LED]   YELLOW (GPIO 32)= WiFi Status (blinking when connected)");
+  
   // Initialize hardware watchdog (8 second timeout)
   initWatchdog();
   feedWatchdog();
@@ -1626,28 +1689,33 @@ void loop() {
     scrollPos++;
   }
 
+  // Update WiFi LED (blinks when connected, off when disconnected)
+  ledWifiUpdate();
+
   // UI refresh
   if (millis() - lastUiMs > UI_MS) {
     lastUiMs = millis();
     switch (state) {
-      case STATE_IDLE:           uiIdle(); break;
-      case ENTER_PIN:      uiEnterPin(); break;
-      case VERIFYING_PIN:  uiVerifyingPin(); break;
-      case ENTER_LITERS:   uiEnterLiters(); break;
-      case CONFIRM_READY:  uiConfirmReady(); break;
+      case STATE_IDLE:           uiIdle(); ledPumpOff(); break;
+      case ENTER_PIN:      uiEnterPin(); ledPumpOff(); break;
+      case VERIFYING_PIN:  uiVerifyingPin(); ledPumpOff(); break;
+      case ENTER_LITERS:   uiEnterLiters(); ledPumpOff(); break;
+      case CONFIRM_READY:  uiConfirmReady(); ledPumpOff(); break;
       case DISPENSING:     
         uiDispense(); 
+        ledPumpOn();  // Green LED ON when dispensing
         feedWatchdog();  // Extra watchdog reset during dispensing
         break;
-      case PAUSED:         uiPaused(); break;
-      case COMPLETING:     uiCompleting(); break;
-      case RECEIPT:        uiReceipt(); break;
-      case ERROR_STATE:    uiError(); break;
+      case PAUSED:         uiPaused(); ledPumpOff(); break;
+      case COMPLETING:     uiCompleting(); ledPumpOff(); break;
+      case RECEIPT:        uiReceipt(); ledPumpOff(); break;
+      case ERROR_STATE:    uiError(); ledPumpOff(); break;
       case ADMIN:
         if (am == AMENU) uiAdminMenu();
         else if (am == A_SELL) uiAdminInput("SELL PRICE:");
         else if (am == A_COST) uiAdminInput("COST PRICE:");
         else if (am == A_CAL)  uiAdminInput("PULSES/L:");
+        ledPumpOff();
         break;
     }
   }
