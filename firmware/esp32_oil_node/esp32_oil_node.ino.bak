@@ -1,0 +1,301 @@
+﻿/********************************************************************
+ * KUPIMISA OIL DISPENSER - SIMPLE WORKING VERSION
+ * ESP32 Dev Module
+ * 
+ * CALIBRATION REQUIRED:
+ * 1. Press 'D' to start calibration
+ * 2. Pump exactly 1 LITER into a measuring container
+ * 3. Press '#' when done
+ * 4. System saves pulses-per-liter
+ ********************************************************************/
+
+#include <Arduino.h>
+#include <Keypad.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+
+/* ================= CONFIG ================= */
+#define PRICE_PER_LITER 45.0f
+
+#define PIN_PUMP 23
+#define PIN_FLOW 4    // GPIO 4 - safe pin with pull-up support
+#define RELAY_ACTIVE_HIGH false
+
+#define DEFAULT_PULSES_PER_LITER 450.0f  // Common for YF-S201 type sensors
+
+/* ================= LCD ================= */
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+/* ================= KEYPAD ================= */
+const byte ROWS = 4, COLS = 4;
+char keys[ROWS][COLS] = {
+  {'D','C','B','A'},
+  {'#','9','6','3'},
+  {'0','8','5','2'},
+  {'*','7','4','1'}
+};
+
+byte rowPins[ROWS] = {13, 12, 14, 27};
+byte colPins[COLS] = {26, 25, 33, 32};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+/* ================= DEBOUNCE ================= */
+uint32_t lastKeyTime = 0;
+char lastKey = 0;
+#define KEY_DEBOUNCE_MS 250  // Ignore keys within 250ms
+
+/* ================= STORAGE ================= */
+Preferences prefs;
+
+/* ================= FLOW ================= */
+volatile uint32_t flowPulses = 0;
+uint32_t lastPulseCount = 0;
+
+float pulsesPerLiter = DEFAULT_PULSES_PER_LITER;
+
+/* ================= STATE ================= */
+enum State {
+  ST_IDLE,
+  ST_DISPENSING,
+  ST_DONE,
+  ST_CALIBRATE
+};
+
+State state = ST_IDLE;
+
+/* ================= VARIABLES ================= */
+String inputBuf = "";
+int32_t targetMl = 0;
+float dispensedMl = 0;
+uint32_t lastLcdMs = 0;
+
+/* ================= RELAY ================= */
+void pumpOn() {
+  digitalWrite(PIN_PUMP, RELAY_ACTIVE_HIGH ? HIGH : LOW);
+  Serial.println(">>> PUMP ON");
+}
+
+void pumpOff() {
+  digitalWrite(PIN_PUMP, RELAY_ACTIVE_HIGH ? LOW : HIGH);
+  Serial.println(">>> PUMP OFF");
+}
+
+/* ================= ISR ================= */
+void IRAM_ATTR onFlowPulse() {
+  flowPulses++;
+}
+
+/* ================= CALIBRATION ================= */
+void loadCalibration() {
+  prefs.begin("cal", true);
+  pulsesPerLiter = prefs.getFloat("ppl", DEFAULT_PULSES_PER_LITER);
+  prefs.end();
+  Serial.printf("Loaded calibration: %.1f pulses/liter\n", pulsesPerLiter);
+}
+
+void saveCalibration() {
+  prefs.begin("cal", false);
+  prefs.putFloat("ppl", pulsesPerLiter);
+  prefs.end();
+  Serial.printf("Saved calibration: %.1f pulses/liter\n", pulsesPerLiter);
+}
+
+/* ================= LCD ================= */
+void lcdShow(const String &l1, const String &l2 = "") {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print(l1.substring(0,16));
+  lcd.setCursor(0,1);
+  lcd.print(l2.substring(0,16));
+}
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n\n=== KUPIMISA OIL DISPENSER ===");
+
+  pinMode(PIN_PUMP, OUTPUT);
+  pumpOff();
+
+  pinMode(PIN_FLOW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(PIN_FLOW), onFlowPulse, FALLING);
+
+  // Set keypad debounce
+  keypad.setDebounceTime(50);
+  keypad.setHoldTime(500);
+
+  Wire.begin(21, 22);
+  lcd.init();
+  lcd.backlight();
+
+  loadCalibration();
+
+  lcdShow("K45=1L  D=CAL", "ENTER KWACHA:");
+  Serial.println("Ready. Enter amount or press D for calibration.");
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  
+  // Calculate dispensed ml from pulses
+  noInterrupts();
+  uint32_t pulses = flowPulses;
+  interrupts();
+  
+  dispensedMl = (pulses / pulsesPerLiter) * 1000.0f;
+
+  /* ===== DISPENSING STATE ===== */
+  if (state == ST_DISPENSING) {
+    
+    // Debug every 200ms
+    if (millis() - lastLcdMs >= 200) {
+      lastLcdMs = millis();
+      
+      int32_t remaining = targetMl - (int32_t)dispensedMl;
+      if (remaining < 0) remaining = 0;
+      
+      // Update LCD
+      char line1[17], line2[17];
+      sprintf(line1, "OUT: %4d ml", (int)dispensedMl);
+      sprintf(line2, "REM: %4d ml", remaining);
+      lcd.setCursor(0,0); lcd.print(line1);
+      lcd.setCursor(0,1); lcd.print(line2);
+      
+      // Debug to serial
+      Serial.printf("Pulses:%lu  Out:%dml  Target:%dml\n", 
+                    pulses, (int)dispensedMl, targetMl);
+    }
+    
+    // STOP when target reached (with small margin for pump lag)
+    if (dispensedMl >= (targetMl - 5)) {
+      pumpOff();
+      
+      Serial.printf("=== COMPLETE === Dispensed: %d ml (target: %d ml)\n", 
+                    (int)dispensedMl, targetMl);
+      
+      lcdShow("COMPLETE!", String((int)dispensedMl) + " ml");
+      state = ST_DONE;
+    }
+  }
+
+  /* ===== DONE STATE ===== */
+  if (state == ST_DONE) {
+    delay(3000);
+    inputBuf = "";
+    flowPulses = 0;
+    state = ST_IDLE;
+    lcdShow("K45=1L  D=CAL", "ENTER KWACHA:");
+  }
+
+  /* ===== CALIBRATION STATE ===== */
+  if (state == ST_CALIBRATE) {
+    if (millis() - lastLcdMs >= 200) {
+      lastLcdMs = millis();
+      char buf[17];
+      sprintf(buf, "PULSES: %lu", pulses);
+      lcd.setCursor(0,0); lcd.print("PUMP 1 LITER    ");
+      lcd.setCursor(0,1); lcd.print(buf);
+      Serial.printf("CAL: %lu pulses\n", pulses);
+    }
+  }
+
+  /* ===== KEYPAD INPUT ===== */
+  char k = keypad.getKey();
+  
+  // DEBOUNCE: Ignore if too soon after last key
+  if (k) {
+    if (millis() - lastKeyTime < KEY_DEBOUNCE_MS) {
+      return; // Ignore ghost press
+    }
+    lastKeyTime = millis();
+    lastKey = k;
+  } else {
+    return; // No key pressed
+  }
+  
+  Serial.printf("Key: %c\n", k);
+
+  // CANCEL with *
+  if (k == '*') {
+    pumpOff();
+    inputBuf = "";
+    flowPulses = 0;
+    state = ST_IDLE;
+    lcdShow("CANCELLED", "");
+    delay(1000);
+    lcdShow("K45=1L  D=CAL", "ENTER KWACHA:");
+    return;
+  }
+
+  // CALIBRATION MODE
+  if (state == ST_IDLE && k == 'D') {
+    flowPulses = 0;
+    pumpOn();
+    state = ST_CALIBRATE;
+    lcdShow("PUMP 1 LITER", "# WHEN DONE");
+    Serial.println("=== CALIBRATION: Pump exactly 1 liter, then press # ===");
+    return;
+  }
+
+  // END CALIBRATION
+  if (state == ST_CALIBRATE && k == '#') {
+    pumpOff();
+    if (pulses > 10) {
+      pulsesPerLiter = (float)pulses;
+      saveCalibration();
+      lcdShow("CALIBRATED!", "PPL=" + String((int)pulsesPerLiter));
+      Serial.printf("=== CALIBRATION SAVED: %d pulses/liter ===\n", (int)pulsesPerLiter);
+    } else {
+      lcdShow("CAL FAILED", "NO PULSES!");
+      Serial.println("=== CALIBRATION FAILED: No pulses detected! ===");
+    }
+    delay(2000);
+    state = ST_IDLE;
+    lcdShow("K45=1L  D=CAL", "ENTER KWACHA:");
+    return;
+  }
+
+  // NUMBER INPUT
+  if (state == ST_IDLE && isdigit(k)) {
+    inputBuf += k;
+    lcdShow("AMOUNT:", "K" + inputBuf);
+  }
+
+  // START DISPENSING with #
+  if (state == ST_IDLE && k == '#' && inputBuf.length() > 0) {
+    float amountK = inputBuf.toFloat();
+    inputBuf = "";
+    
+    // Calculate target: K45 = 1000ml (1 liter)
+    // K5 = 5/45 * 1000 = 111ml
+    // K10 = 10/45 * 1000 = 222ml
+    // K20 = 20/45 * 1000 = 444ml
+    // K45 = 45/45 * 1000 = 1000ml
+    targetMl = (int32_t)((amountK / PRICE_PER_LITER) * 1000.0f);
+    
+    // Calculate how many pulses we need to count
+    int32_t pulsesNeeded = (int32_t)((targetMl / 1000.0f) * pulsesPerLiter);
+    
+    Serial.println("=====================================");
+    Serial.printf("PRICE: K45 = 1 Liter\n");
+    Serial.printf("INPUT: K%.0f\n", amountK);
+    Serial.printf("TARGET: %d ml\n", targetMl);
+    Serial.printf("CALIBRATION: %.0f pulses per liter\n", pulsesPerLiter);
+    Serial.printf("PULSES NEEDED: %d\n", pulsesNeeded);
+    Serial.println("=====================================");
+    
+    flowPulses = 0;
+    lastPulseCount = 0;
+    dispensedMl = 0;
+    
+    // Show target on LCD
+    char line2[17];
+    sprintf(line2, "TARGET:%dml", targetMl);
+    lcdShow("DISPENSING...", line2);
+    delay(1000);
+    
+    pumpOn();
+    state = ST_DISPENSING;
+  }
+}
