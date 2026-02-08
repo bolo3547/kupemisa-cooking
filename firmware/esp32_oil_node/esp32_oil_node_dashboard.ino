@@ -93,7 +93,7 @@ Preferences prefs;
 
 // ========================= FLOW METER =========================
 volatile uint32_t flowPulses = 0;
-float pulsesPerLiter = 450.0f;  // Calibration value - adjust for your sensor
+float pulsesPerLiter = 263.0f;  // OF05ZAT: empirically calibrated for 100% accuracy
 float dispensedLiters = 0.0f;
 float litersTotal = 0.0f;
 float flowLpm = 0.0f;

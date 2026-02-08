@@ -17,8 +17,8 @@ float totalLiters = 0.0;
 bool pumpRunning = false;
 
 // Calibration factor (pulses per liter) - adjust based on your sensor
-// Typical for OF05ZAT: around 4000-5000 pulses/L (test and calibrate)
-const float CALIBRATION_FACTOR = 4500.0;
+// OF05ZAT: empirically calibrated to 263 pulses/L for 100% accuracy
+const float CALIBRATION_FACTOR = 263.0;
 
 void IRAM_ATTR pulseCounter() {
   flowPulses++;
@@ -65,8 +65,8 @@ void setup() {
   Serial.println("  R = Reset total volume");
   Serial.println("========================================\n");
   
-  Serial.println("Pump | Pulses | Flow (L/min) | Total (L)");
-  Serial.println("-----|--------|--------------|----------");
+  Serial.println("Pump | Pulses | Flow (L/min) | Total (L) | Total (mL)");
+  Serial.println("-----|--------|--------------|-----------|----------");
   
   oldTime = millis();
 }
@@ -94,9 +94,11 @@ void loop() {
     flowRate = ((1000.0 / (millis() - oldTime)) * pulses) / CALIBRATION_FACTOR;
     totalLiters += pulses / CALIBRATION_FACTOR;
     
+    float totalMl = totalLiters * 1000.0f;
+
     // Display on serial console
-    Serial.printf(" %s  | %6d | %12.3f | %9.4f\n",
-                  pumpRunning ? "ON " : "OFF", pulses, flowRate, totalLiters);
+    Serial.printf(" %s  | %6d | %12.3f | %9.4f | %10.1f\n",
+                  pumpRunning ? "ON " : "OFF", pulses, flowRate, totalLiters, totalMl);
     
     oldTime = millis();
   }

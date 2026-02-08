@@ -231,7 +231,12 @@ export default function DashboardPage() {
           </motion.div>
         ) : (
           <Stagger staggerDelay={0.03}>
-            <div className={`grid grid-cols-1 md:grid-cols-2 lg:grid-cols-${preferences.gridColumns} gap-6`}>
+            <div className={`grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6 ${
+              preferences.gridColumns === '3' ? 'lg:grid-cols-3' : 
+              preferences.gridColumns === '4' ? 'lg:grid-cols-4' : 
+              preferences.gridColumns === '2' ? 'lg:grid-cols-2' : 
+              'lg:grid-cols-4'
+            }`}>
               {filteredDevices.map((device, index) => (
                 <motion.div 
                   key={device.deviceId}

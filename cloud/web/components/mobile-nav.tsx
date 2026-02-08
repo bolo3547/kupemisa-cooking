@@ -37,7 +37,7 @@ export function MobileNav({ isOwner, userEmail, userRole }: MobileNavProps) {
             className="fixed inset-0 bg-black/50 z-40 md:hidden" 
             onClick={closeMenu}
           />
-          <div className="fixed top-0 right-0 h-full w-72 bg-background border-l shadow-lg z-50 md:hidden overflow-y-auto">
+          <div className="fixed top-0 right-0 h-full w-[85vw] max-w-72 bg-background border-l shadow-lg z-50 md:hidden overflow-y-auto">
             <div className="p-6">
               <div className="flex items-center justify-between mb-8">
                 <Link href="/dashboard" className="flex items-center gap-2" onClick={closeMenu}>

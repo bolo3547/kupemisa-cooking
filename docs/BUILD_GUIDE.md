@@ -47,12 +47,16 @@ This system works like a fuel station pump but for cooking oil:
 
 ### Key Features
 
+- **PIN Protection**: Password-protected access prevents unauthorized use
 - **Operator Login**: PIN-based authentication via keypad
 - **Preset Dispensing**: Enter target liters, system auto-stops
-- **Flow Measurement**: Accurate volume tracking with flow sensor
+- **Flow Measurement**: Accurate volume tracking with calibrated flow sensor (263 PPL)
+- **Sales Recording**: Persistent transaction counter and revenue totals (survives reboot)
+- **Money Entry**: Dispense by Kwacha amount, liters, or milliliters
 - **Transaction Recording**: All sales sent to cloud dashboard
 - **Offline Support**: Works without internet, syncs when connected
-- **Safety Features**: Watchdog timer, tamper detection, emergency stop
+- **Safety Features**: No-flow protection, over-dispense safety, emergency stop
+- **Calibration Menu**: In-field calibration via keypad (hold * for 3s)
 
 ---
 
@@ -62,10 +66,10 @@ This system works like a fuel station pump but for cooking oil:
 
 | Component | Specification | Purpose | Estimated Cost |
 |-----------|--------------|---------|----------------|
-| ESP32 Dev Board | ESP32-WROOM-32 | Main controller | $5-10 |
+| ESP32 Dev Board | ESP32-WROOM-32D | Main controller (WiFi + BT) | $5-10 |
 | 16x2 LCD Display | I2C (PCF8574) | User interface | $3-5 |
-| 4x4 Matrix Keypad | Membrane type | Input (PIN, liters) | $2-3 |
-| Flow Sensor | YF-S201 or similar | Measure oil volume | $5-10 |
+| 4x4 Matrix Keypad | Membrane type | Input (PIN, liters, Kwacha) | $2-3 |
+| Flow Sensor | AICHI OF05ZAT or YF-S201 | Measure oil volume | $5-10 |
 | Relay Module | 5V, 4-channel | Control 12V pump | $3-5 |
 | 12V DC Pump | 3-5A capacity | Dispense oil | $15-30 |
 | Buzzer | 3.3V active | Audio feedback | $1 |
@@ -257,63 +261,51 @@ ESP32 GPIO PINOUT FOR OIL DISPENSER
 │                      OPERATING SEQUENCE                          │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
-│  1. IDLE STATE                                                   │
-│     LCD: "WAIT AUTH"                                             │
-│          "Press A Login"                                         │
-│     Pump: OFF                                                    │
+│  1. LOCKED STATE                                                 │
+│     LCD: "OIL DISPENSER"                                         │
+│          "A = Login"                                             │
+│     Pump: OFF, keypad locked                                     │
 │                                                                  │
 │              │                                                   │
 │              ▼ Press 'A'                                         │
 │                                                                  │
 │  2. ENTER PIN                                                    │
 │     LCD: "Enter PIN:"                                            │
-│          "****"                                                  │
+│          "****_ #=OK *=Back"                                     │
 │     Keys: 0-9 to enter, # to confirm, * to cancel               │
+│     B = backspace, max 3 wrong attempts → 30s lockout            │
 │                                                                  │
 │              │                                                   │
-│              ▼ Press '#'                                         │
+│              ▼ Press '#' (PIN correct)                           │
 │                                                                  │
-│  3. VERIFY PIN                                                   │
-│     - Online: Send to cloud API for verification                 │
-│     - Offline: Check against cached PIN hashes                   │
-│                                                                  │
-│              │                                                   │
-│              ▼ PIN Valid                                         │
-│                                                                  │
-│  4. ENTER LITERS                                                 │
-│     LCD: "Enter Liters:"                                         │
-│          "0"                                                     │
-│     Keys: 0-9 to enter, # to confirm, * to cancel               │
+│  3. SELECT AMOUNT (IDLE STATE)                                   │
+│     LCD: "A=5L B=10 C=20"                                        │
+│          "#=ENTER K  D=50L"                                      │
+│     Presets: A=5L, B=10L, C=20L, D=50L                           │
+│     Custom: # then enter K/L/mL, press D to cycle modes          │
 │                                                                  │
 │              │                                                   │
-│              ▼ Press '#'                                         │
+│              ▼ Select amount                                     │
 │                                                                  │
-│  5. READY TO DISPENSE                                            │
-│     LCD: "READY 50.0L"                                           │
-│          "D=Start *=Cancel"                                      │
-│                                                                  │
-│              │                                                   │
-│              ▼ Press 'D'                                         │
-│                                                                  │
-│  6. DISPENSING                                                   │
-│     LCD: "PUMPING..."                                            │
-│          "25.5 / 50.0 L"                                         │
+│  4. DISPENSING                                                   │
+│     LCD: "T5.00L D2.345L"                                        │
+│          "1.5L/m *=STOP"                                         │
 │     Pump: ON (relay activated)                                   │
 │     Flow sensor: Counting pulses                                 │
 │                                                                  │
 │              │                                                   │
-│              ▼ Target reached OR Press '*'                       │
+│              ▼ Target reached OR Press '*' to pause              │
 │                                                                  │
-│  7. SALE COMPLETE                                                │
-│     LCD: "DONE! 50.0L"                                           │
-│          "K1,250.00"                                             │
+│  5. SALE COMPLETE                                                │
+│     LCD: "DONE! TX#42"                                           │
+│          "K225 5.00L"                                            │
 │     Pump: OFF                                                    │
-│     Transaction sent to cloud                                    │
+│     Transaction recorded to NVS (persistent)                     │
 │                                                                  │
 │              │                                                   │
-│              ▼ Auto-logout after 3 seconds                       │
+│              ▼ Press any key                                     │
 │                                                                  │
-│  → Return to IDLE STATE                                          │
+│  → Return to LOCKED STATE (PIN required again)                   │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -322,13 +314,13 @@ ESP32 GPIO PINOUT FOR OIL DISPENSER
 
 | Key | Function |
 |-----|----------|
-| `A` | Start login (enter PIN mode) |
-| `0-9` | Enter numbers (PIN or liters) |
+| `A` | Login (from locked screen) / Preset 5L (from idle) |
+| `0-9` | Enter numbers (PIN, Kwacha, liters, mL) |
 | `#` | Confirm/Submit |
-| `*` | Cancel/Emergency Stop |
-| `D` | Start dispensing |
+| `*` | Cancel/Back/Emergency Stop (pause during dispense) |
+| `D` | Preset 50L (from idle) / Cycle entry mode K→L→mL (custom entry) |
 | `B` | Backspace (delete last digit) |
-| `C` | Clear all input |
+| `C` | Preset 20L (from idle) |
 
 ### Data Flow
 
@@ -399,11 +391,22 @@ const char* WIFI_PASS = "your-wifi-password";
 ### Step 5: Test the System
 
 1. Power on the system
-2. LCD should show "WAIT AUTH / Press A Login"
-3. Press `A`, enter PIN `1234`, press `#`
-4. Enter liters, press `#`
-5. Press `D` to start pump
-6. Press `*` to stop
+2. LCD should show "OIL DISPENSER / A = Login"
+3. Press `A` to enter PIN mode
+4. Enter PIN `1234` (default), press `#`
+5. LCD shows "PIN OK! Welcome" then dispense menu
+6. Select amount: press `A` for 5L, or `#` then enter custom Kwacha amount
+7. System dispenses and auto-stops at target
+8. LCD shows "DONE! TX#1" with amount — press any key to return to locked screen
+
+### Serial Monitor Commands
+
+Open serial monitor at 115200 baud:
+- `s` = Status (current state, flow, calibration, sales totals)
+- `t` = Sales report (transaction count, total liters, total revenue)
+- `r` = Reset (stop pump, return to locked state)
+- `d` = Reset calibration to defaults
+- `h` = Help
 
 ---
 
@@ -423,23 +426,26 @@ static const bool PUMP_ACTIVE_HIGH = true;
 
 ### Flow Sensor Calibration
 
-Adjust pulses per liter for your specific sensor:
+The default calibration is 263 pulses per liter (empirically calibrated for OF05ZAT sensor).
+Use the built-in calibration menu (hold `*` for 3 seconds from idle screen):
+
+1. Press `1` then `#` to dispense exactly 1L
+2. Measure the real volume dispensed in mL
+3. Enter the real mL value, press `#`
+4. New PPL is automatically calculated and saved to NVS
 
 ```cpp
-#define PULSES_PER_LITER 450  // YF-S201 default
-// Calibrate by measuring actual volume vs counted pulses
+// In src/main.cpp — default value (auto-adjusted by calibration menu)
+static const float DEFAULT_PPL = 263.0f;  // corrected for 100% accuracy
 ```
 
-### Offline Operators
+### PIN Configuration
 
-Pre-configure operators for offline mode:
+Change the default operator PIN in `src/main.cpp`:
 
 ```cpp
-#define OFFLINE_HASH_1 "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4"  // PIN: 1234
-#define OFFLINE_NAME_1 "Operator 1"
+static const char* OPERATOR_PIN = "1234";  // change for your site
 ```
-
-Generate SHA256 hash: `echo -n "1234" | sha256sum`
 
 ---
 

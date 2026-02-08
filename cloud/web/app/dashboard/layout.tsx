@@ -16,7 +16,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
   const isOwner = session.user.role === 'OWNER';
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background via-background to-muted/20">
+    <div className="min-h-screen min-h-[100dvh] bg-gradient-to-br from-background via-background to-muted/20 flex flex-col">
       <header className="glass-effect sticky top-0 z-30 smooth-shadow">
         <div className="container mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
           {/* Logo - hidden on mobile, shown on desktop */}
@@ -74,7 +74,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
           />
         </div>
       </header>
-      <main className="container mx-auto px-4 sm:px-6 py-8">{children}</main>
+      <main className="container mx-auto px-3 sm:px-6 py-4 sm:py-8 flex-1 safe-area-inset">{children}</main>
     </div>
   );
 }
