@@ -1,32 +1,39 @@
 /********************************************************************
- * ESP32 OIL DISPENSER — DASHBOARD CONNECTED + PIN + SALES ✅
+ * ESP32 OIL DISPENSER — DASHBOARD CONTROLLED ✅
  *
  * Inspired by GDI Tech (Kenya) commercial oil dispensers.
  * Uses ESP-WROOM-32D instead of Arduino UNO for WiFi + more RAM/flash.
  *
  * KEY FEATURES (matching commercial dispenser standards):
- *  ✅ Dashboard communication — telemetry, receipts, config sync
- *  ✅ PIN/password protection — prevents unauthorized access
- *  ✅ Sales transaction recording — persistent count + totals in NVS
- *  ✅ Accurate flow measurement — calibrated PPL with overshoot compensation
- *  ✅ Money + volume entry modes (Kwacha / Liters / mL)
- *  ✅ Preset buttons (A=5L, B=10L, C=20L, D=50L)
- *  ✅ Calibration menu (hold * for 3s)
+ *  ✅ Dashboard-controlled — device obeys dashboard commands only
+ *  ✅ Command polling — polls /api/device/commands/pull for DISPENSE_TARGET
+ *  ✅ Command acknowledgment — sends ACK to /api/device/commands/ack
+ *  ✅ PIN/password protection — prevents unauthorized physical access
+ *  ✅ Accurate flow measurement — calibrated PPL with coast/drip settling
  *  ✅ No-flow protection, over-dispense safety, emergency stop
- *  ✅ Offline-capable — works without WiFi, syncs when connected
+ *  ✅ Calibration menu (hold * for 3s from WAIT_DASHBOARD)
  *
  * DASHBOARD API ROUTES:
- *  POST /api/ingest/telemetry  — periodic sensor data
- *  POST /api/ingest/receipt    — dispense transaction records
- *  POST /api/ingest/heartbeat  — periodic keep-alive
- *  GET  /api/device/config     — fetch pricing & settings
+ *  GET  /api/device/commands/pull — poll for pending commands
+ *  POST /api/device/commands/ack  — acknowledge command execution
+ *  POST /api/ingest/telemetry     — periodic sensor data
+ *  POST /api/ingest/receipt       — dispense transaction records
+ *  POST /api/ingest/heartbeat     — periodic keep-alive
+ *  GET  /api/device/config        — fetch pricing & settings
  *
- * OPERATING SEQUENCE:
+ * OPERATING SEQUENCE (dashboard-controlled):
  *  1. Press A to login → enter PIN → # to confirm
- *  2. Select amount (preset or custom K/L/mL)
- *  3. Dispense auto-stops at target
- *  4. Transaction recorded locally + sent to dashboard
- *  5. Returns to locked screen
+ *  2. Device shows "WAIT DASHBOARD" — polls for commands
+ *  3. Dashboard sends DISPENSE_TARGET (liters + price)
+ *  4. LCD shows "AUTH: 10.0L" — press D to start
+ *  5. Dispense auto-stops at target with coast/drip settling
+ *  6. Receipt sent to dashboard, returns to WAIT DASHBOARD
+ *
+ * SUPPORTED COMMANDS:
+ *  DISPENSE_TARGET  — authorize dispense with target liters
+ *  PUMP_ON          — emergency pump control
+ *  PUMP_OFF         — emergency pump stop
+ *  SET_PRICE_PER_LITER — update local price display
  *
  * Hardware:
  *  - ESP32-WROOM-32D Dev Module
@@ -35,7 +42,7 @@
  *  - Relay/Pump on GPIO23 (ACTIVE LOW)
  *  - AICHI OF05ZAT Flow Sensor signal on GPIO4
  *
- * CALIBRATION MENU (hold * for 3s from IDLE):
+ * CALIBRATION MENU (hold * for 3s from WAIT_DASHBOARD):
  *  1 = Set PPL (dispense 1L, measure real mL, compute new PPL)
  *  2 = Tune Overshoot (adjust stopExtra pulses)
  *  3 = Reset to Defaults
@@ -161,9 +168,10 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ========================= STATE =========================
 enum DeviceState : uint8_t {
-  STATE_LOCKED,        // PIN-protected locked screen
-  STATE_ENTER_PIN,     // Entering PIN
-  STATE_IDLE,
+  STATE_LOCKED,          // PIN-protected locked screen
+  STATE_ENTER_PIN,       // Entering PIN
+  STATE_WAIT_DASHBOARD,  // Waiting for dashboard DISPENSE_TARGET command
+  STATE_AUTHORIZED,      // Dashboard authorized dispense — press D to start
   STATE_DISPENSING,
   STATE_PAUSED,
   STATE_COMPLETE,
@@ -174,6 +182,13 @@ enum DeviceState : uint8_t {
   STATE_CAL_DISPENSE
 };
 DeviceState state = STATE_LOCKED;
+
+// ========================= DASHBOARD COMMAND VARS =========================
+static const uint32_t POLL_INTERVAL_MS = 2500;  // poll dashboard every 2.5s
+uint32_t lastPollMs = 0;
+String currentCommandId = "";
+String operatorId = "";
+uint32_t dispenseStartUnix = 0;
 
 // ========================= FLOW VARS =========================
 volatile uint32_t pulseCount = 0;
@@ -197,19 +212,9 @@ bool settlingActive = false;
 uint32_t settlingStartMs = 0;
 uint32_t dispenseStartMs = 0;  // for duration tracking
 
-// ========================= AMOUNTS =========================
-static const float PRESET_A_L = 5.0f;
-static const float PRESET_B_L = 10.0f;
-static const float PRESET_C_L = 20.0f;
-static const float PRESET_D_L = 50.0f;
-
-// ========================= CUSTOM ENTRY =========================
-// 0=Liters, 1=mL, 2=Money
-String customAmount = "";
-bool enteringCustom = false;
-uint8_t entryMode = 2;          // default to money entry
-float enteredKwacha = 0.0f;     // FIXED displayed K when money mode used
-bool moneyModeActive = false;   // true only when dispense started from money
+// Auto-return timer: show receipt for 3s, then return to WAIT_DASHBOARD
+uint32_t completeShowMs = 0;
+static const uint32_t COMPLETE_SHOW_MS = 3000;
 
 uint32_t lastDisplayUpdate = 0;
 
@@ -533,6 +538,145 @@ static void sendDashboardReceipt(float targetL, float dispensedL, float pricePer
   }
 }
 
+/** Send command acknowledgment: POST /api/device/commands/ack */
+static void sendCommandAck(const String& commandId, bool ok, const char* message) {
+  if (!wifiConnected) return;
+
+  StaticJsonDocument<256> doc;
+  doc["commandId"] = commandId;
+  doc["ok"] = ok;
+  doc["message"] = message;
+  doc["executedAt"] = unixNow();
+
+  String body;
+  serializeJson(doc, body);
+
+  String response;
+  int code = httpPost("/api/device/commands/ack", body, response);
+
+  Serial.printf("[ACK] %s -> HTTP %d\n", ok ? "OK" : "FAIL", code);
+}
+
+// Forward declarations for UI functions used in command handler
+static void showWaitDashboard();
+static void showAuthorized();
+
+/**
+ * Poll dashboard for pending commands
+ * Dashboard API: GET /api/device/commands/pull
+ *
+ * Handles:
+ *  - DISPENSE_TARGET: { "liters": 10.0, "operatorId": "...", "pricePerLiter": 25.0 }
+ *  - PUMP_ON: Emergency pump control
+ *  - PUMP_OFF: Emergency pump stop
+ *  - SET_PRICE_PER_LITER: { "price": 25.0 }
+ */
+static void pollDashboardCommands() {
+  if (!wifiConnected) return;
+
+  // Only poll when waiting for authorization, or periodically for emergency commands
+  // DISPENSE_TARGET only accepted in WAIT_DASHBOARD
+  // PUMP_ON/PUMP_OFF accepted in ANY state (safety)
+
+  String response;
+  int code = httpGet("/api/device/commands/pull", response);
+
+  if (code == 429 || code != 200) {
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    Serial.printf("[POLL] JSON parse error: %s\n", err.c_str());
+    return;
+  }
+
+  if (!doc["ok"].as<bool>() || doc["command"].isNull()) {
+    return;
+  }
+
+  // Extract command
+  String cmdId = doc["command"]["id"].as<String>();
+  String cmdType = doc["command"]["type"].as<String>();
+  JsonObject payload = doc["command"]["payloadJson"].as<JsonObject>();
+
+  Serial.printf("[POLL] Command: id=%s type=%s\n", cmdId.c_str(), cmdType.c_str());
+
+  // ---- SAFETY: Emergency pump commands accepted in ANY state ----
+  if (cmdType == "PUMP_ON") {
+    pumpOn();
+    sendCommandAck(cmdId, true, "Pump ON");
+    return;
+  }
+  if (cmdType == "PUMP_OFF") {
+    pumpOff();
+    settlingActive = false;
+    if (state == STATE_DISPENSING) {
+      detachFlow();
+      total_L += dispensed_L;
+      sendDashboardReceipt(target_L, dispensed_L,
+        (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER, "EMERGENCY_STOP");
+      returnToWaitDashboard();
+    }
+    sendCommandAck(cmdId, true, "Pump OFF");
+    return;
+  }
+  if (cmdType == "SET_PRICE_PER_LITER") {
+    if (!payload.isNull() && payload.containsKey("price")) {
+      float newPrice = payload["price"].as<float>();
+      if (newPrice > 0) {
+        dashboardPrice = newPrice;
+        sendCommandAck(cmdId, true, "Price updated");
+      } else {
+        sendCommandAck(cmdId, false, "Invalid price");
+      }
+    } else {
+      sendCommandAck(cmdId, false, "Missing price field");
+    }
+    return;
+  }
+
+  // ---- DISPENSE_TARGET: only accepted in WAIT_DASHBOARD state ----
+  if (cmdType == "DISPENSE_TARGET") {
+    if (state != STATE_WAIT_DASHBOARD) {
+      Serial.println("[CMD] Ignored DISPENSE_TARGET — not in WAIT_DASHBOARD state");
+      sendCommandAck(cmdId, false, "Device busy");
+      return;
+    }
+
+    if (payload.isNull() || !payload.containsKey("liters")) {
+      sendCommandAck(cmdId, false, "Missing liters field");
+      return;
+    }
+
+    currentCommandId = cmdId;
+    float liters = payload["liters"].as<float>();
+
+    if (payload.containsKey("operatorId")) {
+      operatorId = payload["operatorId"].as<String>();
+    }
+    if (payload.containsKey("pricePerLiter")) {
+      dashboardPrice = payload["pricePerLiter"].as<float>();
+    }
+
+    if (liters >= MIN_LITERS && liters <= MAX_LITERS) {
+      target_L = liters;
+      state = STATE_AUTHORIZED;
+      showAuthorized();
+      Serial.printf("[CMD] DISPENSE_TARGET: %.2fL authorized\n", liters);
+      sendCommandAck(cmdId, true, "Ready to dispense");
+    } else {
+      Serial.printf("[CMD] Invalid liters: %.3f\n", liters);
+      sendCommandAck(cmdId, false, "Invalid target liters");
+    }
+  }
+  else {
+    Serial.printf("[CMD] Unknown: %s\n", cmdType.c_str());
+    sendCommandAck(cmdId, false, "Unknown command type");
+  }
+}
+
 /** Run periodic dashboard tasks (non-blocking, called from loop) */
 static void handleDashboard() {
   if (!wifiConnected) {
@@ -558,6 +702,12 @@ static void handleDashboard() {
   if (now - lastConfigFetchMs > CONFIG_FETCH_INTERVAL_MS) {
     lastConfigFetchMs = now;
     fetchDeviceConfig();
+  }
+
+  // Poll for dashboard commands (only in WAIT_DASHBOARD state)
+  if (now - lastPollMs > POLL_INTERVAL_MS) {
+    lastPollMs = now;
+    pollDashboardCommands();
   }
 }
 
@@ -604,35 +754,22 @@ static void showEnterPin() {
   lcdPrintPadded(0, 1, line2);
 }
 
-static void showIdle() {
+static void showWaitDashboard() {
   lcd.clear();
-  lcdPrintPadded(0, 0, "A=5L B=10 C=20");
-  lcdPrintPadded(0, 1, "#=ENTER K  D=50L");
+  lcdPrintPadded(0, 0, "WAIT DASHBOARD");
+  lcdPrintPadded(0, 1, wifiConnected ? "Polling..." : "WiFi OFFLINE");
 }
 
-static void showCustomEntry() {
+static void showAuthorized() {
   lcd.clear();
-
-  if (entryMode == 2) {
-    lcdPrintPadded(0, 0, "Enter K:   D=L");
-    if (customAmount.length()) {
-      float k = customAmount.toFloat();
-      float priceUsed = (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER;
-      float liters = k / priceUsed;
-      String l2 = "K" + customAmount + " = ";
-      if (liters >= 1.0f) l2 += String(liters, 2) + "L";
-      else l2 += String((int)roundf(liters * 1000.0f)) + "mL";
-      lcdPrintPadded(0, 1, l2);
-    } else {
-      lcdPrintPadded(0, 1, "K_ #=OK *=Back");
-    }
-  } else if (entryMode == 1) {
-    lcdPrintPadded(0, 0, "Enter mL:  D=K");
-    lcdPrintPadded(0, 1, (customAmount.length() ? (customAmount + "mL #=OK") : "_mL #=OK *=Back"));
+  char l1[17];
+  if (target_L >= 1.0f) {
+    snprintf(l1, sizeof(l1), "AUTH: %.1fL", target_L);
   } else {
-    lcdPrintPadded(0, 0, "Enter L:   D=mL");
-    lcdPrintPadded(0, 1, (customAmount.length() ? (customAmount + "L  #=OK") : "_L  #=OK *=Back"));
+    snprintf(l1, sizeof(l1), "AUTH: %dmL", (int)roundf(target_L * 1000.0f));
   }
+  lcdPrintPadded(0, 0, String(l1));
+  lcdPrintPadded(0, 1, "D=START *=CANCEL");
 }
 
 static void showPaused() {
@@ -648,7 +785,7 @@ static void showComplete() {
 
   // Record transaction in NVS
   float priceUsed = (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER;
-  float cost = moneyModeActive ? enteredKwacha : (target_L * priceUsed);
+  float cost = target_L * priceUsed;
   recordTransaction(dispensed_L, cost);
 
   // Send receipt to dashboard
@@ -658,17 +795,7 @@ static void showComplete() {
   snprintf(l1, sizeof(l1), "DONE! TX#%lu", (unsigned long)transactionCount);
   lcdPrintPadded(0, 0, String(l1));
 
-  // ✅ FIX: if money mode used, ALWAYS display entered K and TARGET volume (not actual)
-  if (moneyModeActive && enteredKwacha > 0.0f) {
-    String line2 = "K" + String((int)roundf(enteredKwacha)) + " ";
-    // Use target_L (what they paid for), not dispensed_L
-    if (target_L >= 1.0f) line2 += String(target_L, 2) + "L";
-    else line2 += String((int)roundf(target_L * 1000.0f)) + "mL";
-    lcdPrintPadded(0, 1, line2);
-    return;
-  }
-
-  // For L/mL mode, also show TARGET (what they asked for)
+  // Show target volume and cost
   String line2;
   if (target_L >= 1.0f) line2 = String(target_L, 2) + "L K" + String((int)roundf(cost));
   else line2 = String((int)roundf(target_L * 1000.0f)) + "mL K" + String((int)roundf(cost));
@@ -759,37 +886,34 @@ static void resetDispense() {
   settlingActive = false;
   settlingStartMs = 0;
   dispenseStartMs = 0;
-
-  // entry reset
-  customAmount = "";
-  enteringCustom = false;
-  entryMode = 2;
-
-  // NOTE: DO NOT reset enteredKwacha/moneyModeActive here!
-  // They must persist until showComplete() uses them.
-  // They are reset in returnToIdle() instead.
 }
 
-// Reset money mode variables (called when returning to IDLE)
-static void resetMoneyMode() {
-  enteredKwacha = 0.0f;
-  moneyModeActive = false;
+static void resetTransaction() {
+  resetDispense();
+  currentCommandId = "";
+  operatorId = "";
+  dispenseStartUnix = 0;
 }
 
 static void resetAll() {
-  resetDispense();
-  resetMoneyMode();
+  resetTransaction();
   total_L = 0.0f;
   Serial.println("All counters reset!");
 }
 
 // Helper: return to locked screen (used after complete/fault/reset)
 static void returnToLocked() {
-  resetDispense();
-  resetMoneyMode();
+  resetTransaction();
   pinEntry = "";
   state = STATE_LOCKED;
   showLocked();
+}
+
+// Helper: return to dashboard-waiting state (after dispense complete)
+static void returnToWaitDashboard() {
+  resetTransaction();
+  state = STATE_WAIT_DASHBOARD;
+  showWaitDashboard();
 }
 
 // ========================= START DISPENSE =========================
@@ -901,6 +1025,7 @@ static void calculateFlow() {
         state = STATE_COMPLETE;
         total_L += dispensed_L;
         showComplete();
+        completeShowMs = millis();  // start auto-return timer (non-blocking)
       }
     }
     return;  // skip normal dispense logic during settling
@@ -1023,8 +1148,8 @@ static void handleCalKeypad(char key) {
         delay(1500);
         showCalMenu();
       } else if (key == '*') {
-        state = STATE_IDLE;
-        showIdle();
+        state = STATE_WAIT_DASHBOARD;
+        showWaitDashboard();
       } else if (key == 'A' || key == 'B') {
         calMenuPage = (calMenuPage + 1) % 2;
         showCalMenu();
@@ -1128,8 +1253,8 @@ static void handleCalKeypad(char key) {
 static void handleKeypad() {
   const uint32_t now = millis();
 
-  // Hold * to enter CAL menu (only in IDLE, not entering custom)
-  if (state == STATE_IDLE && !enteringCustom) {
+  // Hold * to enter CAL menu (only in WAIT_DASHBOARD state)
+  if (state == STATE_WAIT_DASHBOARD) {
     if (keypad.isPressed('*')) {
       if (!starHeld) {
         if (starHoldStart == 0) starHoldStart = now;
@@ -1162,7 +1287,7 @@ static void handleKeypad() {
   lastKey = key;
   lastKeyTime = keyNow;
 
-  Serial.printf("KEY: %c\n", key);
+  Serial.printf("KEY: %c (state=%u)\n", key, (uint8_t)state);
 
   // Calibration states
   if (state == STATE_CAL_MENU || state == STATE_CAL_REAL_VOL ||
@@ -1201,15 +1326,15 @@ static void handleKeypad() {
       } else if (key == '#') {
         // Confirm PIN
         if (pinEntry == String(OPERATOR_PIN)) {
-          // PIN correct
+          // PIN correct — go to WAIT_DASHBOARD (not IDLE)
           pinAttempts = 0;
           pinEntry = "";
-          state = STATE_IDLE;
           lcd.clear();
           lcdPrintPadded(0, 0, "PIN OK!");
-          lcdPrintPadded(0, 1, "Welcome");
+          lcdPrintPadded(0, 1, "Dashboard mode");
           delay(800);
-          showIdle();
+          state = STATE_WAIT_DASHBOARD;
+          showWaitDashboard();
         } else {
           // Wrong PIN
           pinAttempts++;
@@ -1246,128 +1371,28 @@ static void handleKeypad() {
       }
       break;
 
-    case STATE_IDLE:
-      if (enteringCustom) {
-        if (key >= '0' && key <= '9') {
-          if (customAmount.length() < 6) {
-            customAmount += key;
-            showCustomEntry();
-          }
-        } else if (key == '.') {
-          // decimal allowed in L and K, not mL
-          if (entryMode != 1 && customAmount.indexOf('.') == -1 && customAmount.length() < 5) {
-            customAmount += key;
-            showCustomEntry();
-          }
-        } else if (key == 'D') {
-          // cycle modes: K -> L -> mL -> K
-          entryMode = (entryMode + 1) % 3;
-          showCustomEntry();
-        } else if (key == '*') {
-          enteringCustom = false;
-          entryMode = 2;
-          customAmount = "";
-          showIdle();
-        } else if (key == '#') {
-          if (!customAmount.length()) return;
+    case STATE_WAIT_DASHBOARD:
+      // Keypad mostly disabled — waiting for dashboard command
+      // Only * returns to locked screen
+      if (key == '*') {
+        returnToLocked();
+      }
+      break;
 
-          float amt = customAmount.toFloat();
-
-          // ========= MONEY MODE (FIXED DISPLAY) =========
-          if (entryMode == 2) {
-            // Validate K range
-            if (amt < MIN_KWACHA || amt > MAX_KWACHA) {
-              lcd.clear();
-              lcdPrintPadded(0, 0, "Invalid Kwacha!");
-              lcdPrintPadded(0, 1, "K5 - K500 only");
-              delay(1500);
-              showCustomEntry();
-              return;
-            }
-
-            enteredKwacha = amt;
-            moneyModeActive = true;
-
-            float priceForCalc = (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER;
-            float liters = enteredKwacha / priceForCalc;
-
-            // safety liters range
-            if (liters < MIN_LITERS || liters > MAX_LITERS) {
-              lcd.clear();
-              lcdPrintPadded(0, 0, "Volume out range");
-              lcdPrintPadded(0, 1, "Check limits");
-              delay(1500);
-              showCustomEntry();
-              return;
-            }
-
-            enteringCustom = false;
-            customAmount = "";
-            startDispense(liters);
-            return;
-          }
-
-          // ========= mL MODE =========
-          moneyModeActive = false;
-          enteredKwacha = 0.0f;
-
-          if (entryMode == 1) {
-            float liters = amt / 1000.0f;
-            if (liters < MIN_LITERS || liters > MAX_LITERS) {
-              lcd.clear();
-              lcdPrintPadded(0, 0, "Invalid amount!");
-              lcdPrintPadded(0, 1, "50mL-50L only");
-              delay(1500);
-              showCustomEntry();
-              return;
-            }
-            enteringCustom = false;
-            customAmount = "";
-            startDispense(liters);
-            return;
-          }
-
-          // ========= L MODE =========
-          {
-            float liters = amt;
-            if (liters < MIN_LITERS || liters > MAX_LITERS) {
-              lcd.clear();
-              lcdPrintPadded(0, 0, "Invalid amount!");
-              lcdPrintPadded(0, 1, "50mL-50L only");
-              delay(1500);
-              showCustomEntry();
-              return;
-            }
-            enteringCustom = false;
-            customAmount = "";
-            startDispense(liters);
-            return;
-          }
+    case STATE_AUTHORIZED:
+      // Dashboard has authorized — D=start, *=cancel
+      if (key == 'D') {
+        // Start dispensing the dashboard-authorized amount
+        startDispense(target_L);
+        dispenseStartUnix = unixNow();
+      } else if (key == '*') {
+        // Cancel — send canceled receipt + ACK, return to wait
+        sendDashboardReceipt(target_L, 0.0f,
+          (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER, "CANCELED");
+        if (currentCommandId.length() > 0) {
+          sendCommandAck(currentCommandId, false, "User canceled before start");
         }
-
-      } else {
-        switch (key) {
-          case 'A': moneyModeActive = false; enteredKwacha = 0; startDispense(PRESET_A_L); break;
-          case 'B': moneyModeActive = false; enteredKwacha = 0; startDispense(PRESET_B_L); break;
-          case 'C': moneyModeActive = false; enteredKwacha = 0; startDispense(PRESET_C_L); break;
-          case 'D': moneyModeActive = false; enteredKwacha = 0; startDispense(PRESET_D_L); break;
-
-          case '#':
-            enteringCustom = true;
-            customAmount = "";
-            entryMode = 2;  // default to money entry
-            showCustomEntry();
-            break;
-
-          default:
-            if (key >= '0' && key <= '9') {
-              enteringCustom = true;
-              entryMode = 2; // default to money entry
-              customAmount = String(key);
-              showCustomEntry();
-            }
-            break;
-        }
+        returnToWaitDashboard();
       }
       break;
 
@@ -1391,25 +1416,25 @@ static void handleKeypad() {
         pumpOn();
         state = STATE_DISPENSING;
       } else if (key == '*') {
-        // cancel
+        // cancel — send canceled receipt, return to waiting for dashboard
         pumpOff();
         detachFlow();
-        state = STATE_IDLE;
         total_L += dispensed_L;
-        resetDispense();
-        resetMoneyMode();
-        showIdle();
+        sendDashboardReceipt(target_L, dispensed_L,
+          (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER, "CANCELED");
+        returnToWaitDashboard();
       }
       break;
 
     case STATE_COMPLETE:
-      returnToLocked();
+      // Any key returns to wait for next dashboard command
+      returnToWaitDashboard();
       break;
 
     case STATE_FAULT:
       pumpOff();
       detachFlow();
-      returnToLocked();
+      returnToWaitDashboard();
       break;
 
     default:
@@ -1437,7 +1462,6 @@ static void handleSerial() {
       Serial.printf("Pump: %s\n", pumpRunning ? "ON" : "OFF");
       Serial.printf("PPL: %.1f | StopLag: %lu ms | StopExtra: %u\n",
                     pulsesPerLiter, (unsigned long)stopLagMs, stopExtraPulses);
-      Serial.printf("MoneyActive=%d EnteredK=%.0f\n", moneyModeActive ? 1 : 0, enteredKwacha);
       Serial.printf("--- SALES ---\n");
       Serial.printf("Transactions: %u\n", transactionCount);
       Serial.printf("Total Sold: %.2f L\n", salesTotal_L);
@@ -1447,8 +1471,12 @@ static void handleSerial() {
                     wifiConnected ? WiFi.RSSI() : -127);
       Serial.printf("Dashboard: %s\n", API_BASE_URL);
       Serial.printf("Device: %s\n", DEVICE_ID);
+      Serial.printf("Mode: DASHBOARD-CONTROLLED\n");
       if (dashboardPrice > 0.0f) {
         Serial.printf("Dashboard Price: %.2f/L\n", dashboardPrice);
+      }
+      if (currentCommandId.length() > 0) {
+        Serial.printf("Current Cmd: %s\n", currentCommandId.c_str());
       }
       Serial.println("==============\n");
       break;
@@ -1500,6 +1528,15 @@ static void updateDisplay() {
 
   if (state == STATE_DISPENSING) showDispensing();
   if (state == STATE_CAL_DISPENSE) showCalDispensing();
+  if (state == STATE_WAIT_DASHBOARD) showWaitDashboard();
+
+  // Auto-return to WAIT_DASHBOARD after showing receipt
+  if (state == STATE_COMPLETE && completeShowMs > 0) {
+    if ((millis() - completeShowMs) >= COMPLETE_SHOW_MS) {
+      completeShowMs = 0;
+      returnToWaitDashboard();
+    }
+  }
 }
 
 // ========================= SETUP / LOOP =========================
@@ -1515,6 +1552,19 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   loadCalibration();
+
+  // One-time reset: clear local sales data when switching to dashboard mode
+  // Uses a migration flag so it only happens once, not on every reboot
+  prefs.begin("oilsales", false);
+  bool migrated = prefs.getBool("dashMode", false);
+  if (!migrated) {
+    prefs.putUInt("txCount", 0);
+    prefs.putFloat("totalL", 0.0f);
+    prefs.putFloat("totalK", 0.0f);
+    prefs.putBool("dashMode", true);
+    Serial.println("[RESET] Sales data cleared — switching to dashboard mode");
+  }
+  prefs.end();
   loadSalesData();
 
   Wire.begin(SDA_PIN, SCL_PIN);
@@ -1533,14 +1583,14 @@ void setup() {
   lcdPrintPadded(0, 1, "Connecting WiFi");
 
   Serial.println("\n=============================================");
-  Serial.println("ESP32 OIL DISPENSER — DASHBOARD CONNECTED");
+  Serial.println("ESP32 OIL DISPENSER — DASHBOARD CONTROLLED");
   Serial.println("=============================================");
   Serial.printf("Device: %s  Site: %s\n", DEVICE_ID, SITE_NAME);
   Serial.printf("Dashboard: %s\n", API_BASE_URL);
+  Serial.printf("Mode: DASHBOARD-CONTROLLED (obeys commands)\n");
   Serial.printf("FLOW_PIN=%u EDGE=%s\n", FLOW_PIN, (FLOW_EDGE == FALLING) ? "FALLING" : "RISING");
   Serial.printf("PPL=%.1f (NVS)\n", pulsesPerLiter);
   Serial.printf("StopLag=%lu ms, StopExtra=%u pulses\n", (unsigned long)stopLagMs, stopExtraPulses);
-  Serial.printf("Sales: %u TX, %.2fL, K%.2f\n", transactionCount, salesTotal_L, salesTotal_K);
 
   // Connect WiFi
   connectWiFi();
@@ -1556,8 +1606,9 @@ void setup() {
     lastHeartbeatMs = millis();
   }
 
-  Serial.println("PIN protection ENABLED. Press A to login.");
-  Serial.println("Hold * for 3s to enter CAL menu (after login).");
+  Serial.println("State flow: LOCKED → PIN → WAIT_DASHBOARD → AUTHORIZED → DISPENSING → COMPLETE → WAIT_DASHBOARD");
+  Serial.println("Keypad LOCKED until dashboard sends DISPENSE_TARGET command.");
+  Serial.println("Hold * for 3s in WAIT_DASHBOARD to enter CAL menu.");
   Serial.printf("WiFi: %s | Dashboard: %s\n",
                 wifiConnected ? "ONLINE" : "OFFLINE",
                 wifiConnected ? "CONNECTED" : "will sync when available");
@@ -1579,5 +1630,5 @@ void loop() {
   handleKeypad();
   handleSerial();
   updateDisplay();
-  handleDashboard();  // WiFi + telemetry + heartbeat + config sync
+  handleDashboard();  // WiFi + telemetry + heartbeat + config + command polling
 }
