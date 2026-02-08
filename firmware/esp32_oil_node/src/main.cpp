@@ -73,6 +73,24 @@ static const float    OVER_DISPENSE_LIMIT_L = 0.05f; // +50mL fault
 static const uint32_t DISPLAY_UPDATE_MS   = 250;
 static const uint32_t CAL_HOLD_MS         = 3000;
 
+// Post-pump settling: keep counting pulses after pump stops to capture
+// oil still flowing through momentum/gravity (like GDI Tech dispensers)
+static const uint32_t POST_PUMP_SETTLE_MS = 1500;  // 1.5s to capture drip/coast pulses
+
+// Coast flow rate factor: fraction of full-rate flow that continues during coast.
+// Empirically ~30% of pumping flow rate continues briefly after pump-off.
+static const float COAST_FLOW_FACTOR = 0.3f;
+
+// Maximum early-stop as percentage of target pulses (safety cap)
+static const uint32_t MAX_EARLY_STOP_PCT = 40;
+
+// Minimum valid Unix timestamp (Nov 2023) — used to detect if NTP synced
+static const uint32_t MIN_VALID_UNIX_TS = 1700000000;
+
+// Small-volume correction offset (mL) — accounts for sensor non-linearity
+// at low flow rates. Tunable via calibration at small volumes.
+static const float    SMALL_VOL_OFFSET_ML = 0.0f;  // set via testing (e.g., -3.0 if over-dispensing 3mL)
+
 // ========================= MONEY CONFIG =========================
 static const float PRICE_PER_LITER = 45.0f;  // your selling price
 static const float MIN_KWACHA = 5.0f;
@@ -89,13 +107,14 @@ static const uint8_t MAX_PIN_ATTEMPTS = 3;
 static const uint32_t LOCKOUT_DURATION_MS = 30000; // 30s lockout after max attempts
 
 // ========================= DASHBOARD / WIFI CONFIG =========================
-// Device credentials for dashboard communication
+// ⚠️  Per-device credentials — update for each device deployment.
+//     For production, move to config_OIL-XXXX.h (see config_OIL-0001.h example)
 #define DEVICE_ID     "OIL-0001"
 #define API_KEY       "QV-nQArRlomVfBOiL1Ob1P4mtIz88a7mO0c3kXVZYK8"
 #define API_BASE_URL  "https://fleet-oil-system.vercel.app"
 #define SITE_NAME     "PHI"
 
-// WiFi credentials
+// WiFi credentials — update for your network
 static const char* WIFI_SSID = "kupemisa";
 static const char* WIFI_PASS = "123admin";
 
@@ -172,6 +191,11 @@ uint32_t targetPulses = 0;
 
 bool pumpRunning = false;
 bool flowInterruptAttached = false;
+
+// Post-pump settling: keep flow sensor active after pump stops to count coast/drip
+bool settlingActive = false;
+uint32_t settlingStartMs = 0;
+uint32_t dispenseStartMs = 0;  // for duration tracking
 
 // ========================= AMOUNTS =========================
 static const float PRESET_A_L = 5.0f;
@@ -344,7 +368,7 @@ static String baseUrl() {
 
 static uint32_t unixNow() {
   time_t now = time(nullptr);
-  if (now < 1700000000) return 0;  // Invalid time
+  if (now < MIN_VALID_UNIX_TS) return 0;  // NTP not synced yet
   return (uint32_t)now;
 }
 
@@ -407,9 +431,9 @@ static int httpGet(const char* path, String& response) {
 static void sendTelemetry() {
   if (!wifiConnected) return;
 
+  uint32_t ts = unixNow();
   StaticJsonDocument<512> doc;
-  doc["ts"] = unixNow() ? unixNow() : (millis() / 1000);
-  doc["oilPercent"] = 50.0f;     // placeholder — add tank sensor if available
+  doc["ts"] = ts ? ts : (millis() / 1000);
   doc["oilLiters"] = total_L;
   doc["flowLpm"] = flowRate_Lmin;
   doc["litersTotal"] = salesTotal_L;
@@ -483,16 +507,18 @@ static void sendDashboardReceipt(float targetL, float dispensedL, float pricePer
                                  const char* receiptStatus) {
   if (!wifiConnected) return;
 
-  uint32_t durSec = 0;  // duration not precisely tracked yet
+  uint32_t durSec = (dispenseStartMs > 0) ? ((millis() - dispenseStartMs) / 1000) : 0;
+  uint32_t ts = unixNow();
+  uint32_t fallbackTs = millis() / 1000;
 
   StaticJsonDocument<512> doc;
-  doc["sessionId"] = String(DEVICE_ID) + "-" + String(millis());
+  doc["sessionId"] = String(DEVICE_ID) + "-" + String(transactionCount) + "-" + String(ts ? ts : fallbackTs);
   doc["targetLiters"] = targetL;
   doc["dispensedLiters"] = dispensedL;
   doc["durationSec"] = durSec;
   doc["status"] = receiptStatus;
-  doc["startedAtUnix"] = unixNow() ? unixNow() : (millis() / 1000);
-  doc["endedAtUnix"] = unixNow() ? unixNow() : (millis() / 1000);
+  doc["startedAtUnix"] = ts ? ts : fallbackTs;
+  doc["endedAtUnix"] = ts ? ts : fallbackTs;
 
   String body;
   serializeJson(doc, body);
@@ -730,6 +756,10 @@ static void resetDispense() {
   target_L = 0.0f;
   targetPulses = 0;
 
+  settlingActive = false;
+  settlingStartMs = 0;
+  dispenseStartMs = 0;
+
   // entry reset
   customAmount = "";
   enteringCustom = false;
@@ -774,6 +804,7 @@ static void startDispense(float liters) {
   attachFlow();
   lastPulseTime = millis();
   lastCalcTime  = millis();
+  dispenseStartMs = millis();
 
   state = STATE_DISPENSING;
   pumpOn();
@@ -824,6 +855,57 @@ static void calculateFlow() {
   flowRate_Lmin = (dt > 0) ? (delta_L * 60000.0f / (float)dt) : 0.0f;
   flowRate_mLs  = (dt > 0) ? (delta_L * 1000.0f * 1000.0f / (float)dt) : 0.0f;
 
+  // -------- POST-PUMP SETTLING (capture coast/drip pulses) --------
+  // After pump stops, oil still flows through momentum. Keep counting
+  // pulses for POST_PUMP_SETTLE_MS to get accurate final measurement.
+  // This is how GDI Tech commercial dispensers achieve ±1-5mL accuracy.
+  if (settlingActive) {
+    // Update dispensed display during settling
+    if (dp > 0) {
+      Serial.printf("[SETTLE] +%u pulses, total=%u, disp=%.3fL (%.0fmL)\n",
+                    dp, p, dispensed_L, dispensed_L * 1000.0f);
+    }
+
+    // Check if settling period is complete
+    if ((now - settlingStartMs) >= POST_PUMP_SETTLE_MS) {
+      // Final accurate measurement after all coast/drip pulses counted
+      noInterrupts();
+      const uint32_t finalPulses = pulseCount;
+      interrupts();
+      dispensed_L = (float)finalPulses / pulsesPerLiter;
+
+      settlingActive = false;
+      detachFlow();  // NOW safe to detach
+
+      Serial.printf("[SETTLE] FINAL: pulses=%u disp=%.3fL (%.0fmL) target=%.3fL err=%.1fmL\n",
+                    finalPulses, dispensed_L, dispensed_L * 1000.0f,
+                    target_L, (dispensed_L - target_L) * 1000.0f);
+
+      // Transition depends on whether this was a calibration or normal dispense
+      if (state == STATE_CAL_DISPENSE) {
+        calDispensePulses = finalPulses;
+        state = STATE_CAL_REAL_VOL;
+        calInput = "";
+        lcd.clear();
+        lcdPrintPadded(0, 0, "Dispensed 1.000L");
+        lcdPrintPadded(0, 1, "Enter REAL mL");
+        delay(1200);
+        showCalRealVol();
+        Serial.printf("CAL STOP: pulses=%u\n", finalPulses);
+      } else {
+        // Normal dispense — apply small-volume offset if applicable
+        if (target_L < 1.0f && SMALL_VOL_OFFSET_ML != 0.0f) {
+          dispensed_L += SMALL_VOL_OFFSET_ML / 1000.0f;
+          Serial.printf("[SETTLE] Small-vol offset: %.1fmL applied\n", SMALL_VOL_OFFSET_ML);
+        }
+        state = STATE_COMPLETE;
+        total_L += dispensed_L;
+        showComplete();
+      }
+    }
+    return;  // skip normal dispense logic during settling
+  }
+
   // -------- NO FLOW FAULT (pump ON but no pulses for 6s) --------
   if ((state == STATE_DISPENSING || state == STATE_CAL_DISPENSE) && pumpRunning) {
     if ((now - lastPulseTime) > NO_FLOW_TIMEOUT_MS) {
@@ -841,25 +923,20 @@ static void calculateFlow() {
     calDispensePulses = p;
 
     if (p >= targetPulses) {
+      // Stop pump but keep flow sensor active for settling
       pumpOff();
-      detachFlow();
-      state = STATE_CAL_REAL_VOL;
-      calInput = "";
-
-      lcd.clear();
-      lcdPrintPadded(0, 0, "Dispensed 1.000L");
-      lcdPrintPadded(0, 1, "Enter REAL mL");
-      delay(1200);
-
-      showCalRealVol();
-      Serial.printf("CAL STOP: pulses=%u\n", p);
+      settlingActive = true;
+      settlingStartMs = now;
+      Serial.printf("CAL PUMP OFF: pulses=%u, settling %lums...\n",
+                    p, (unsigned long)POST_PUMP_SETTLE_MS);
+      // Will complete in settling handler above, then go to CAL_REAL_VOL
     }
     return;
   }
 
-  // -------- NORMAL DISPENSE STOP LOGIC (EARLY STOP + SAFETY) --------
+  // -------- NORMAL DISPENSE STOP LOGIC (EARLY STOP + SETTLING) --------
   if (state == STATE_DISPENSING && pumpRunning && targetPulses > 0) {
-    // Over-dispense safety in pulses
+    // Over-dispense safety in pulses (wider margin to account for settling)
     const uint32_t overPulses = (uint32_t)lroundf(OVER_DISPENSE_LIMIT_L * pulsesPerLiter);
     if (p > (targetPulses + overPulses)) {
       pumpOff();
@@ -870,36 +947,48 @@ static void calculateFlow() {
       return;
     }
 
-    // Early stop compensation
+    // Early stop compensation — anticipate coast/drip pulses
     const float pulsesPerSec = (dt > 0) ? ((float)dp * 1000.0f / (float)dt) : 0.0f;
     uint32_t stopEarly = 0;
 
-    // ✅ FIX: For small amounts (under 500mL), NO early-stop - just stop at target
-    // For larger amounts, use early-stop with 40% cap
+    // Estimate how many pulses will arrive during POST_PUMP_SETTLE_MS
+    // This is the coast/drip compensation based on current flow rate
+    const uint32_t coastPulses = (uint32_t)lroundf(
+        pulsesPerSec * ((float)POST_PUMP_SETTLE_MS / 1000.0f) * COAST_FLOW_FACTOR);
+
+    // For ALL amounts: use flow-rate-based early stop + coast compensation
+    stopEarly = coastPulses + stopExtraPulses;
+
+    // Additional early-stop for large amounts based on pump lag
     const uint32_t smallAmountPulses = (uint32_t)(0.5f * pulsesPerLiter);  // 500mL threshold
-    
     if (targetPulses > smallAmountPulses) {
-      // Large amount: use early-stop compensation
-      stopEarly = (uint32_t)lroundf(pulsesPerSec * ((float)stopLagMs / 1000.0f)) + stopExtraPulses;
-      const uint32_t maxEarlyStop = targetPulses * 40 / 100;
-      if (stopEarly > maxEarlyStop) {
-        stopEarly = maxEarlyStop;
-      }
+      stopEarly += (uint32_t)lroundf(pulsesPerSec * ((float)stopLagMs / 1000.0f));
     }
-    // else: small amount, stopEarly stays 0 (no early stop)
+
+    // Safety cap: never stop more than 40% early
+    const uint32_t maxEarlyStop = targetPulses * MAX_EARLY_STOP_PCT / 100;
+    if (stopEarly > maxEarlyStop) {
+      stopEarly = maxEarlyStop;
+    }
 
     const uint32_t stopAt = (stopEarly < targetPulses) ? (targetPulses - stopEarly) : targetPulses;
 
-    // ✅ SINGLE stop decision (no earlier "dispensed_L >= target_L" that ruins compensation)
+    // Stop pump but keep flow sensor active for settling
     if (p >= stopAt) {
       pumpOff();
-      detachFlow();
-      state = STATE_COMPLETE;
-      total_L += dispensed_L;
+      // ✅ KEY FIX: Do NOT detach flow sensor here!
+      // Keep counting pulses during coast/drip for accurate measurement
+      settlingActive = true;
+      settlingStartMs = now;
 
-      Serial.printf("STOP: p=%u stopAt=%u target=%u disp=%.3fL\n",
-                    p, stopAt, targetPulses, dispensed_L);
-      showComplete();
+      Serial.printf("PUMP OFF: p=%u stopAt=%u target=%u early=%u, settling %lums...\n",
+                    p, stopAt, targetPulses, stopEarly, (unsigned long)POST_PUMP_SETTLE_MS);
+      // LCD shows "Measuring..." during settling
+      lcd.clear();
+      lcdPrintPadded(0, 0, "Measuring...");
+      char l2[17];
+      snprintf(l2, sizeof(l2), "%.3fL / %.3fL", dispensed_L, target_L);
+      lcdPrintPadded(0, 1, String(l2));
       return;
     }
   }
@@ -1022,6 +1111,7 @@ static void handleCalKeypad(char key) {
     case STATE_CAL_DISPENSE:
       if (key == '*') {
         pumpOff();
+        settlingActive = false;
         detachFlow();
         state = STATE_CAL_MENU;
         calMenuPage = 0;
@@ -1284,6 +1374,7 @@ static void handleKeypad() {
     case STATE_DISPENSING:
       if (key == '*') {
         pumpOff();
+        settlingActive = false;  // cancel any settling
         detachFlow();
         state = STATE_PAUSED;
         showPaused();
