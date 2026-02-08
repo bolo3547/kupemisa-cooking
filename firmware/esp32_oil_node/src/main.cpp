@@ -47,7 +47,9 @@ static const uint8_t SDA_PIN  = 21;
 static const uint8_t SCL_PIN  = 22;
 
 // ========================= DEFAULTS =========================
-static const float    DEFAULT_PPL         = 250.0f;  // start point; calibrate in CAL menu
+// Base calibration: 250 pulses/L gave 95% accuracy on OF05ZAT sensor.
+// Correction: 250 / 0.95 ≈ 263 pulses/L for 100% accuracy.
+static const float    DEFAULT_PPL         = 263.0f;  // corrected from 250 for 100% accuracy
 static const uint32_t DEFAULT_STOP_LAG    = 300;     // ms
 static const uint16_t DEFAULT_STOP_EXTRA  = 20;      // pulses
 

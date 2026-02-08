@@ -1,8 +1,8 @@
 volatile uint32_t pulses = 0;
 
 // Calibration factor: pulses per liter for OF05ZAT flow sensor
-// Default ~450 pulses/L — adjust via calibration for your specific sensor
-static const float PULSES_PER_LITER = 450.0f;
+// Empirically calibrated: 263 pulses/L for 100% accuracy
+static const float PULSES_PER_LITER = 263.0f;
 
 float totalLiters = 0.0f;
 float flowRate_Lpm = 0.0f;

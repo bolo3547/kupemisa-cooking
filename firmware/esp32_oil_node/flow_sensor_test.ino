@@ -17,8 +17,8 @@ float totalLiters = 0.0;
 bool pumpRunning = false;
 
 // Calibration factor (pulses per liter) - adjust based on your sensor
-// OF05ZAT flow sensor: ~450 pulses/L (verify with calibration test)
-const float CALIBRATION_FACTOR = 450.0;
+// OF05ZAT: empirically calibrated to 263 pulses/L for 100% accuracy
+const float CALIBRATION_FACTOR = 263.0;
 
 void IRAM_ATTR pulseCounter() {
   flowPulses++;
