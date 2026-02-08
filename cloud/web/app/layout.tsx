@@ -57,7 +57,7 @@ export default function RootLayout({
         <meta name="apple-mobile-web-app-status-bar-style" content="default" />
         <meta name="mobile-web-app-capable" content="yes" />
       </head>
-      <body className={inter.className}>
+      <body className={`${inter.className} min-h-screen min-h-[100dvh]`}>
         <Providers>{children}</Providers>
         <Toaster />
         <script
