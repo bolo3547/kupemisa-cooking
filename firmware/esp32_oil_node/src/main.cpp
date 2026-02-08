@@ -688,12 +688,12 @@ static void handleKeypad() {
   if (!key) return;
 
   // ✅ FIX: Extra debounce - ignore rapid repeated same key
-  uint32_t now = millis();
-  if (key == lastKey && (now - lastKeyTime) < KEY_REPEAT_DELAY) {
+  uint32_t keyNow = millis();
+  if (key == lastKey && (keyNow - lastKeyTime) < KEY_REPEAT_DELAY) {
     return;  // ignore too-fast repeat
   }
   lastKey = key;
-  lastKeyTime = now;
+  lastKeyTime = keyNow;
 
   Serial.printf("KEY: %c\n", key);
 
