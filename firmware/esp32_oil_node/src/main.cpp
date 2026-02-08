@@ -1,31 +1,32 @@
 /********************************************************************
- * ESP32 OIL DISPENSER — CALIBRATION + SAFETY (OLD CODE, FIXED MONEY) ✅
+ * ESP32 OIL DISPENSER — PIN PROTECTION + SALES TRACKING ✅
  *
- * FIXES DONE (based on your "old codes"):
- *  1) ✅ Money mode now ALWAYS prints the ENTERED Kwacha (K5–K500),
- *     not the calculated amount (so K45 will finish as K45, not K41).
- *  2) ✅ Removed the "simple stop by volume" that was killing early-stop logic.
- *     Now early-stop overshoot compensation actually works.
- *  3) ✅ NVS is no longer cleared on every boot (calibration now persists).
- *  4) ✅ When dispensing stops (complete/pause/fault), flow interrupt is detached
- *     (software "flow sensor off"). Re-attached on start/resume.
+ * Inspired by GDI Tech (Kenya) commercial oil dispensers.
+ * Uses ESP-WROOM-32D instead of Arduino UNO for WiFi + more RAM/flash.
+ *
+ * KEY FEATURES (matching commercial dispenser standards):
+ *  ✅ PIN/password protection — prevents unauthorized access
+ *  ✅ Sales transaction recording — persistent count + totals in NVS
+ *  ✅ Accurate flow measurement — calibrated PPL with overshoot compensation
+ *  ✅ Money + volume entry modes (Kwacha / Liters / mL)
+ *  ✅ Preset buttons (A=5L, B=10L, C=20L, D=50L)
+ *  ✅ Calibration menu (hold * for 3s)
+ *  ✅ No-flow protection, over-dispense safety, emergency stop
+ *
+ * OPERATING SEQUENCE:
+ *  1. Press A to login → enter PIN → # to confirm
+ *  2. Select amount (preset or custom K/L/mL)
+ *  3. Dispense auto-stops at target
+ *  4. Transaction recorded, returns to locked screen
  *
  * Hardware:
- *  - ESP32 Dev Module
+ *  - ESP32-WROOM-32D Dev Module
  *  - 16x2 I2C LCD @ 0x27 (SDA=21, SCL=22)
  *  - 4x4 Keypad  rows=13,12,14,27  cols=26,25,33,32
  *  - Relay/Pump on GPIO23 (ACTIVE LOW)
  *  - AICHI OF05ZAT Flow Sensor signal on GPIO4
  *
- * Features:
- *  - Presets A/B/C/D + custom amount in L / mL / Kwacha
- *  - NVS-stored calibration (pulses per liter)
- *  - Overshoot compensation (tunable stopLag + stopExtra)
- *  - Over-dispense safety hard stop (+50mL = FAULT)
- *  - Improved no-flow protection (6s timeout)
- *  - Calibration menu (hold * for 3s from IDLE)
- *
- * CALIBRATION MENU (hold * for 3s):
+ * CALIBRATION MENU (hold * for 3s from IDLE):
  *  1 = Set PPL (dispense 1L, measure real mL, compute new PPL)
  *  2 = Tune Overshoot (adjust stopExtra pulses)
  *  3 = Reset to Defaults
@@ -67,6 +68,13 @@ static const float MAX_KWACHA = 500.0f;
 static const float MIN_LITERS = 0.05f; // 50mL
 static const float MAX_LITERS = 50.0f;
 
+// ========================= PIN PROTECTION =========================
+// Password protection for access control (like GDI Tech dispensers)
+static const char* OPERATOR_PIN = "1234";  // default PIN — change for your site
+static const uint8_t MAX_PIN_LENGTH = 6;
+static const uint8_t MAX_PIN_ATTEMPTS = 3;
+static const uint32_t LOCKOUT_DURATION_MS = 30000; // 30s lockout after max attempts
+
 // ========================= NVS (Preferences) =========================
 Preferences prefs;
 float    pulsesPerLiter  = DEFAULT_PPL;
@@ -91,6 +99,8 @@ LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ========================= STATE =========================
 enum DeviceState : uint8_t {
+  STATE_LOCKED,        // PIN-protected locked screen
+  STATE_ENTER_PIN,     // Entering PIN
   STATE_IDLE,
   STATE_DISPENSING,
   STATE_PAUSED,
@@ -101,7 +111,7 @@ enum DeviceState : uint8_t {
   STATE_CAL_OVERSHOOT,
   STATE_CAL_DISPENSE
 };
-DeviceState state = STATE_IDLE;
+DeviceState state = STATE_LOCKED;
 
 // ========================= FLOW VARS =========================
 volatile uint32_t pulseCount = 0;
@@ -147,6 +157,17 @@ bool starHeld = false;
 uint8_t calMenuPage = 0;   // 0/1 pages
 String calInput = "";
 uint32_t calDispensePulses = 0;
+
+// ========================= PIN ENTRY VARS =========================
+String pinEntry = "";
+uint8_t pinAttempts = 0;
+uint32_t lockoutStartMs = 0;
+
+// ========================= TRANSACTION TRACKING =========================
+// Persistent sales recording (survives reboot via NVS)
+uint32_t transactionCount = 0;   // total transactions completed
+float    salesTotal_L     = 0.0f; // total liters sold
+float    salesTotal_K     = 0.0f; // total Kwacha earned
 
 // ========================= ISR =========================
 void IRAM_ATTR flowISR() { pulseCount++; }
@@ -199,6 +220,35 @@ static void resetCalibrationDefaults() {
   saveCalibration();
 }
 
+// ========================= SALES NVS =========================
+static void loadSalesData() {
+  prefs.begin("oilsales", true);
+  transactionCount = prefs.getUInt("txCount", 0);
+  salesTotal_L     = prefs.getFloat("totalL", 0.0f);
+  salesTotal_K     = prefs.getFloat("totalK", 0.0f);
+  prefs.end();
+
+  Serial.printf("Sales: %u transactions, %.2fL, K%.2f\n",
+                transactionCount, salesTotal_L, salesTotal_K);
+}
+
+static void saveSalesData() {
+  prefs.begin("oilsales", false);
+  prefs.putUInt("txCount", transactionCount);
+  prefs.putFloat("totalL", salesTotal_L);
+  prefs.putFloat("totalK", salesTotal_K);
+  prefs.end();
+}
+
+static void recordTransaction(float liters, float kwacha) {
+  transactionCount++;
+  salesTotal_L += liters;
+  salesTotal_K += kwacha;
+  saveSalesData();
+  Serial.printf("TX#%u: %.3fL K%.2f | Total: %.2fL K%.2f\n",
+                transactionCount, liters, kwacha, salesTotal_L, salesTotal_K);
+}
+
 // ========================= LCD HELPERS =========================
 static void lcdPrintPadded(uint8_t col, uint8_t row, const String &text) {
   lcd.setCursor(col, row);
@@ -223,6 +273,25 @@ static void pumpOff() {
 }
 
 // ========================= UI SCREENS =========================
+static void showLocked() {
+  lcd.clear();
+  lcdPrintPadded(0, 0, "OIL DISPENSER");
+  lcdPrintPadded(0, 1, "A = Login");
+}
+
+static void showEnterPin() {
+  lcd.clear();
+  lcdPrintPadded(0, 0, "Enter PIN:");
+  // Build masked PIN display (max 16 chars for LCD row)
+  char buf[17];
+  uint8_t len = pinEntry.length();
+  uint8_t i = 0;
+  for (; i < len && i < 10; i++) buf[i] = '*';
+  buf[i] = '\0';
+  String line2 = String(buf) + " #=OK *=Back";
+  lcdPrintPadded(0, 1, line2);
+}
+
 static void showIdle() {
   lcd.clear();
   lcdPrintPadded(0, 0, "A=5L B=10 C=20");
@@ -263,7 +332,14 @@ static void showPaused() {
 
 static void showComplete() {
   lcd.clear();
-  lcdPrintPadded(0, 0, "COMPLETE!");
+
+  // Record transaction in NVS
+  float cost = moneyModeActive ? enteredKwacha : (target_L * PRICE_PER_LITER);
+  recordTransaction(dispensed_L, cost);
+
+  char l1[17];
+  snprintf(l1, sizeof(l1), "DONE! TX#%lu", (unsigned long)transactionCount);
+  lcdPrintPadded(0, 0, String(l1));
 
   // ✅ FIX: if money mode used, ALWAYS display entered K and TARGET volume (not actual)
   if (moneyModeActive && enteredKwacha > 0.0f) {
@@ -276,7 +352,6 @@ static void showComplete() {
   }
 
   // For L/mL mode, also show TARGET (what they asked for)
-  float cost = target_L * PRICE_PER_LITER;
   String line2;
   if (target_L >= 1.0f) line2 = String(target_L, 2) + "L K" + String((int)roundf(cost));
   else line2 = String((int)roundf(target_L * 1000.0f)) + "mL K" + String((int)roundf(cost));
@@ -385,6 +460,15 @@ static void resetAll() {
   resetMoneyMode();
   total_L = 0.0f;
   Serial.println("All counters reset!");
+}
+
+// Helper: return to locked screen (used after complete/fault/reset)
+static void returnToLocked() {
+  resetDispense();
+  resetMoneyMode();
+  pinEntry = "";
+  state = STATE_LOCKED;
+  showLocked();
 }
 
 // ========================= START DISPENSE =========================
@@ -707,6 +791,80 @@ static void handleKeypad() {
   }
 
   switch (state) {
+    case STATE_LOCKED:
+      // Only 'A' key starts login
+      if (key == 'A' || key == 'a') {
+        // Check lockout
+        if (pinAttempts >= MAX_PIN_ATTEMPTS) {
+          if ((millis() - lockoutStartMs) < LOCKOUT_DURATION_MS) {
+            lcd.clear();
+            lcdPrintPadded(0, 0, "LOCKED OUT!");
+            lcdPrintPadded(0, 1, "Wait 30 sec...");
+            return;
+          }
+          // Lockout expired
+          pinAttempts = 0;
+        }
+        pinEntry = "";
+        state = STATE_ENTER_PIN;
+        showEnterPin();
+      }
+      break;
+
+    case STATE_ENTER_PIN:
+      if (key >= '0' && key <= '9') {
+        if (pinEntry.length() < MAX_PIN_LENGTH) {
+          pinEntry += key;
+          showEnterPin();
+        }
+      } else if (key == '#') {
+        // Confirm PIN
+        if (pinEntry == String(OPERATOR_PIN)) {
+          // PIN correct
+          pinAttempts = 0;
+          pinEntry = "";
+          state = STATE_IDLE;
+          lcd.clear();
+          lcdPrintPadded(0, 0, "PIN OK!");
+          lcdPrintPadded(0, 1, "Welcome");
+          delay(800);
+          showIdle();
+        } else {
+          // Wrong PIN
+          pinAttempts++;
+          pinEntry = "";
+          lcd.clear();
+          lcdPrintPadded(0, 0, "Wrong PIN!");
+          char l2[17];
+          snprintf(l2, sizeof(l2), "%u/%u attempts", pinAttempts, MAX_PIN_ATTEMPTS);
+          lcdPrintPadded(0, 1, String(l2));
+          delay(1200);
+          if (pinAttempts >= MAX_PIN_ATTEMPTS) {
+            lockoutStartMs = millis();
+            lcd.clear();
+            lcdPrintPadded(0, 0, "TOO MANY TRIES");
+            lcdPrintPadded(0, 1, "Locked 30 sec");
+            delay(1500);
+            state = STATE_LOCKED;
+            showLocked();
+          } else {
+            showEnterPin();
+          }
+        }
+      } else if (key == '*') {
+        // Cancel — back to locked
+        pinEntry = "";
+        state = STATE_LOCKED;
+        showLocked();
+      } else if (key == 'B') {
+        // Backspace
+        if (pinEntry.length() > 0) {
+          pinEntry.remove(pinEntry.length() - 1);
+          showEnterPin();
+        }
+      }
+      break;
+
     case STATE_IDLE:
       if (enteringCustom) {
         if (key >= '0' && key <= '9') {
@@ -862,19 +1020,13 @@ static void handleKeypad() {
       break;
 
     case STATE_COMPLETE:
-      state = STATE_IDLE;
-      resetDispense();
-      resetMoneyMode();
-      showIdle();
+      returnToLocked();
       break;
 
     case STATE_FAULT:
       pumpOff();
       detachFlow();
-      state = STATE_IDLE;
-      resetDispense();
-      resetMoneyMode();
-      showIdle();
+      returnToLocked();
       break;
 
     default:
@@ -889,7 +1041,7 @@ static void handleSerial() {
   const char cmd = Serial.read();
   switch (cmd) {
     case 'h': case 'H':
-      Serial.println("Commands: s=status, r=reset, d=defaults");
+      Serial.println("Commands: s=status, r=reset, d=defaults, t=sales report");
       break;
 
     case 's': case 'S':
@@ -903,20 +1055,35 @@ static void handleSerial() {
       Serial.printf("PPL: %.1f | StopLag: %lu ms | StopExtra: %u\n",
                     pulsesPerLiter, (unsigned long)stopLagMs, stopExtraPulses);
       Serial.printf("MoneyActive=%d EnteredK=%.0f\n", moneyModeActive ? 1 : 0, enteredKwacha);
+      Serial.printf("--- SALES ---\n");
+      Serial.printf("Transactions: %u\n", transactionCount);
+      Serial.printf("Total Sold: %.2f L\n", salesTotal_L);
+      Serial.printf("Total Revenue: K%.2f\n", salesTotal_K);
       Serial.println("==============\n");
       break;
 
     case 'r': case 'R':
       pumpOff();
       detachFlow();
-      state = STATE_IDLE;
       resetAll();
-      showIdle();
+      returnToLocked();
       break;
 
     case 'd': case 'D':
       resetCalibrationDefaults();
       Serial.println("Calibration reset to defaults.");
+      break;
+
+    case 't': case 'T':
+      Serial.println("\n=== SALES REPORT ===");
+      Serial.printf("Transactions: %u\n", transactionCount);
+      Serial.printf("Total Sold:   %.2f L\n", salesTotal_L);
+      Serial.printf("Total Revenue: K%.2f\n", salesTotal_K);
+      if (transactionCount > 0) {
+        Serial.printf("Avg per TX:   %.2f L, K%.2f\n",
+                      salesTotal_L / transactionCount, salesTotal_K / transactionCount);
+      }
+      Serial.println("====================\n");
       break;
   }
 }
@@ -944,6 +1111,7 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   loadCalibration();
+  loadSalesData();
 
   Wire.begin(SDA_PIN, SCL_PIN);
   lcd.init();
@@ -961,20 +1129,22 @@ void setup() {
   lcdPrintPadded(0, 1, "PPL=" + String((int)roundf(pulsesPerLiter)));
 
   Serial.println("\n==========================================");
-  Serial.println("ESP32 OIL DISPENSER — FIXED MONEY EDITION");
+  Serial.println("ESP32 OIL DISPENSER — PIN + SALES EDITION");
   Serial.println("==========================================");
   Serial.printf("FLOW_PIN=%u EDGE=%s\n", FLOW_PIN, (FLOW_EDGE == FALLING) ? "FALLING" : "RISING");
   Serial.printf("PPL=%.1f (NVS)\n", pulsesPerLiter);
   Serial.printf("StopLag=%lu ms, StopExtra=%u pulses\n", (unsigned long)stopLagMs, stopExtraPulses);
   Serial.printf("NoFlowTimeout=%lu ms, OverDispenseLimit=%.0fmL\n",
                 (unsigned long)NO_FLOW_TIMEOUT_MS, OVER_DISPENSE_LIMIT_L * 1000.0f);
-  Serial.println("Hold * for 3s to enter CAL menu.");
+  Serial.printf("Sales: %u TX, %.2fL, K%.2f\n", transactionCount, salesTotal_L, salesTotal_K);
+  Serial.println("PIN protection ENABLED. Press A to login.");
+  Serial.println("Hold * for 3s to enter CAL menu (after login).");
   Serial.println("==========================================\n");
 
   delay(1200);
   resetDispense();
-  showIdle();
-  state = STATE_IDLE;
+  showLocked();
+  state = STATE_LOCKED;
 }
 
 void loop() {
