@@ -1,10 +1,11 @@
 /********************************************************************
- * ESP32 OIL DISPENSER — PIN PROTECTION + SALES TRACKING ✅
+ * ESP32 OIL DISPENSER — DASHBOARD CONNECTED + PIN + SALES ✅
  *
  * Inspired by GDI Tech (Kenya) commercial oil dispensers.
  * Uses ESP-WROOM-32D instead of Arduino UNO for WiFi + more RAM/flash.
  *
  * KEY FEATURES (matching commercial dispenser standards):
+ *  ✅ Dashboard communication — telemetry, receipts, config sync
  *  ✅ PIN/password protection — prevents unauthorized access
  *  ✅ Sales transaction recording — persistent count + totals in NVS
  *  ✅ Accurate flow measurement — calibrated PPL with overshoot compensation
@@ -12,12 +13,20 @@
  *  ✅ Preset buttons (A=5L, B=10L, C=20L, D=50L)
  *  ✅ Calibration menu (hold * for 3s)
  *  ✅ No-flow protection, over-dispense safety, emergency stop
+ *  ✅ Offline-capable — works without WiFi, syncs when connected
+ *
+ * DASHBOARD API ROUTES:
+ *  POST /api/ingest/telemetry  — periodic sensor data
+ *  POST /api/ingest/receipt    — dispense transaction records
+ *  POST /api/ingest/heartbeat  — periodic keep-alive
+ *  GET  /api/device/config     — fetch pricing & settings
  *
  * OPERATING SEQUENCE:
  *  1. Press A to login → enter PIN → # to confirm
  *  2. Select amount (preset or custom K/L/mL)
  *  3. Dispense auto-stops at target
- *  4. Transaction recorded, returns to locked screen
+ *  4. Transaction recorded locally + sent to dashboard
+ *  5. Returns to locked screen
  *
  * Hardware:
  *  - ESP32-WROOM-32D Dev Module
@@ -38,6 +47,10 @@
 #include <LiquidCrystal_I2C.h>
 #include <Keypad.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 // ========================= PINS =========================
 static const uint8_t PUMP_PIN = 23;   // active LOW relay
@@ -74,6 +87,36 @@ static const char* OPERATOR_PIN = "1234";  // default PIN — change for your si
 static const uint8_t MAX_PIN_LENGTH = 6;
 static const uint8_t MAX_PIN_ATTEMPTS = 3;
 static const uint32_t LOCKOUT_DURATION_MS = 30000; // 30s lockout after max attempts
+
+// ========================= DASHBOARD / WIFI CONFIG =========================
+// Device credentials for dashboard communication
+#define DEVICE_ID     "OIL-0001"
+#define API_KEY       "QV-nQArRlomVfBOiL1Ob1P4mtIz88a7mO0c3kXVZYK8"
+#define API_BASE_URL  "https://fleet-oil-system.vercel.app"
+#define SITE_NAME     "PHI"
+
+// WiFi credentials
+static const char* WIFI_SSID = "kupemisa";
+static const char* WIFI_PASS = "123admin";
+
+// Dashboard communication timers
+static const uint32_t TELEMETRY_INTERVAL_MS  = 30000;  // send telemetry every 30s
+static const uint32_t HEARTBEAT_INTERVAL_MS  = 60000;  // heartbeat every 60s
+static const uint32_t CONFIG_FETCH_INTERVAL_MS = 120000; // fetch config every 2 min
+static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000;   // retry WiFi every 30s
+
+// HTTPS client
+WiFiClientSecure secureClient;
+bool wifiConnected = false;
+
+// Dashboard timers
+uint32_t lastTelemetryMs   = 0;
+uint32_t lastHeartbeatMs   = 0;
+uint32_t lastConfigFetchMs = 0;
+uint32_t lastWifiRetryMs   = 0;
+
+// Dashboard-synced pricing (overrides local PRICE_PER_LITER when available)
+float dashboardPrice = 0.0f;  // 0 = not fetched yet, use local price
 
 // ========================= NVS (Preferences) =========================
 Preferences prefs;
@@ -249,6 +292,249 @@ static void recordTransaction(float liters, float kwacha) {
                 transactionCount, liters, kwacha, salesTotal_L, salesTotal_K);
 }
 
+// ========================= WIFI =========================
+static void connectWiFi() {
+  if (strlen(WIFI_SSID) == 0) {
+    Serial.println("[WIFI] No SSID configured");
+    return;
+  }
+
+  Serial.printf("[WIFI] Connecting to %s", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.printf("\n[WIFI] Connected! IP: %s RSSI: %d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+
+    // Setup NTP for accurate timestamps
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    Serial.println("[TIME] NTP sync started");
+  } else {
+    wifiConnected = false;
+    Serial.println("\n[WIFI] Connection failed — running offline");
+  }
+}
+
+static void checkWiFi() {
+  wifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (!wifiConnected) {
+    uint32_t now = millis();
+    if (now - lastWifiRetryMs > WIFI_RETRY_INTERVAL_MS) {
+      lastWifiRetryMs = now;
+      Serial.println("[WIFI] Reconnecting...");
+      connectWiFi();
+    }
+  }
+}
+
+// ========================= HTTP HELPERS =========================
+static String baseUrl() {
+  String b = String(API_BASE_URL);
+  if (b.endsWith("/")) b.remove(b.length() - 1);
+  return b;
+}
+
+static uint32_t unixNow() {
+  time_t now = time(nullptr);
+  if (now < 1700000000) return 0;  // Invalid time
+  return (uint32_t)now;
+}
+
+static int httpPost(const char* path, const String& body, String& response) {
+  if (!wifiConnected) return -1;
+
+  HTTPClient http;
+  String url = baseUrl() + String(path);
+
+  Serial.printf("[HTTP] POST %s\n", url.c_str());
+
+  http.begin(secureClient, url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-device-id", String(DEVICE_ID));
+  http.addHeader("x-api-key", String(API_KEY));
+  http.setTimeout(10000);
+
+  int code = http.POST((uint8_t*)body.c_str(), body.length());
+
+  if (code > 0) {
+    response = http.getString();
+    Serial.printf("[HTTP] %d: %.120s\n", code, response.c_str());
+  } else {
+    Serial.printf("[HTTP] Error: %d (%s)\n", code, http.errorToString(code).c_str());
+  }
+
+  http.end();
+  return code;
+}
+
+static int httpGet(const char* path, String& response) {
+  if (!wifiConnected) return -1;
+
+  HTTPClient http;
+  String url = baseUrl() + String(path);
+
+  Serial.printf("[HTTP] GET %s\n", url.c_str());
+
+  http.begin(secureClient, url);
+  http.addHeader("x-device-id", String(DEVICE_ID));
+  http.addHeader("x-api-key", String(API_KEY));
+  http.setTimeout(10000);
+
+  int code = http.GET();
+
+  if (code > 0) {
+    response = http.getString();
+    Serial.printf("[HTTP] %d: %.120s\n", code, response.c_str());
+  } else {
+    Serial.printf("[HTTP] Error: %d (%s)\n", code, http.errorToString(code).c_str());
+  }
+
+  http.end();
+  return code;
+}
+
+// ========================= DASHBOARD API =========================
+
+/** Send telemetry data: POST /api/ingest/telemetry */
+static void sendTelemetry() {
+  if (!wifiConnected) return;
+
+  StaticJsonDocument<512> doc;
+  doc["ts"] = unixNow() ? unixNow() : (millis() / 1000);
+  doc["oilPercent"] = 50.0f;     // placeholder — add tank sensor if available
+  doc["oilLiters"] = total_L;
+  doc["flowLpm"] = flowRate_Lmin;
+  doc["litersTotal"] = salesTotal_L;
+  doc["pumpState"] = pumpRunning;
+  doc["safetyStatus"] = (state == STATE_FAULT) ? "FAULT" : "OK";
+  doc["wifiRssi"] = WiFi.RSSI();
+  doc["uptimeSec"] = millis() / 1000;
+
+  String body;
+  serializeJson(doc, body);
+
+  String response;
+  int code = httpPost("/api/ingest/telemetry", body, response);
+
+  if (code >= 200 && code < 300) {
+    Serial.println("[TELEMETRY] Sent OK");
+  } else {
+    Serial.printf("[TELEMETRY] Failed: %d\n", code);
+  }
+}
+
+/** Send heartbeat: POST /api/ingest/heartbeat */
+static void sendHeartbeat() {
+  if (!wifiConnected) return;
+
+  StaticJsonDocument<128> doc;
+  doc["status"] = "online";
+  doc["uptime"] = millis() / 1000;
+  doc["siteName"] = SITE_NAME;
+
+  String body;
+  serializeJson(doc, body);
+
+  String response;
+  int code = httpPost("/api/ingest/heartbeat", body, response);
+
+  if (code >= 200 && code < 300) {
+    Serial.println("[HEARTBEAT] OK");
+  }
+}
+
+/** Fetch device config: GET /api/device/config */
+static void fetchDeviceConfig() {
+  if (!wifiConnected) return;
+
+  String response;
+  int code = httpGet("/api/device/config", response);
+
+  if (code != 200) {
+    Serial.printf("[CONFIG] Failed: HTTP %d\n", code);
+    return;
+  }
+
+  StaticJsonDocument<512> doc;
+  DeserializationError err = deserializeJson(doc, response);
+  if (err) {
+    Serial.printf("[CONFIG] JSON error: %s\n", err.c_str());
+    return;
+  }
+
+  if (doc["ok"].as<bool>()) {
+    if (doc["price"]["pricePerLiter"].is<float>()) {
+      dashboardPrice = doc["price"]["pricePerLiter"].as<float>();
+      Serial.printf("[CONFIG] Dashboard price: %.2f/L\n", dashboardPrice);
+    }
+  }
+}
+
+/** Send dispense receipt: POST /api/ingest/receipt */
+static void sendDashboardReceipt(float targetL, float dispensedL, float pricePerL,
+                                 const char* receiptStatus) {
+  if (!wifiConnected) return;
+
+  uint32_t durSec = 0;  // duration not precisely tracked yet
+
+  StaticJsonDocument<512> doc;
+  doc["sessionId"] = String(DEVICE_ID) + "-" + String(millis());
+  doc["targetLiters"] = targetL;
+  doc["dispensedLiters"] = dispensedL;
+  doc["durationSec"] = durSec;
+  doc["status"] = receiptStatus;
+  doc["startedAtUnix"] = unixNow() ? unixNow() : (millis() / 1000);
+  doc["endedAtUnix"] = unixNow() ? unixNow() : (millis() / 1000);
+
+  String body;
+  serializeJson(doc, body);
+
+  String response;
+  int code = httpPost("/api/ingest/receipt", body, response);
+
+  if (code >= 200 && code < 300) {
+    Serial.println("[RECEIPT] Sent to dashboard OK");
+  } else {
+    Serial.printf("[RECEIPT] Failed: %d (saved locally)\n", code);
+  }
+}
+
+/** Run periodic dashboard tasks (non-blocking, called from loop) */
+static void handleDashboard() {
+  if (!wifiConnected) {
+    checkWiFi();
+    return;
+  }
+
+  uint32_t now = millis();
+
+  // Periodic telemetry
+  if (now - lastTelemetryMs > TELEMETRY_INTERVAL_MS) {
+    lastTelemetryMs = now;
+    sendTelemetry();
+  }
+
+  // Periodic heartbeat
+  if (now - lastHeartbeatMs > HEARTBEAT_INTERVAL_MS) {
+    lastHeartbeatMs = now;
+    sendHeartbeat();
+  }
+
+  // Periodic config fetch (pricing sync)
+  if (now - lastConfigFetchMs > CONFIG_FETCH_INTERVAL_MS) {
+    lastConfigFetchMs = now;
+    fetchDeviceConfig();
+  }
+}
+
 // ========================= LCD HELPERS =========================
 static void lcdPrintPadded(uint8_t col, uint8_t row, const String &text) {
   lcd.setCursor(col, row);
@@ -305,7 +591,8 @@ static void showCustomEntry() {
     lcdPrintPadded(0, 0, "Enter K:   D=L");
     if (customAmount.length()) {
       float k = customAmount.toFloat();
-      float liters = k / PRICE_PER_LITER;
+      float priceUsed = (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER;
+      float liters = k / priceUsed;
       String l2 = "K" + customAmount + " = ";
       if (liters >= 1.0f) l2 += String(liters, 2) + "L";
       else l2 += String((int)roundf(liters * 1000.0f)) + "mL";
@@ -334,8 +621,12 @@ static void showComplete() {
   lcd.clear();
 
   // Record transaction in NVS
-  float cost = moneyModeActive ? enteredKwacha : (target_L * PRICE_PER_LITER);
+  float priceUsed = (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER;
+  float cost = moneyModeActive ? enteredKwacha : (target_L * priceUsed);
   recordTransaction(dispensed_L, cost);
+
+  // Send receipt to dashboard
+  sendDashboardReceipt(target_L, dispensed_L, priceUsed, "DONE");
 
   char l1[17];
   snprintf(l1, sizeof(l1), "DONE! TX#%lu", (unsigned long)transactionCount);
@@ -907,7 +1198,8 @@ static void handleKeypad() {
             enteredKwacha = amt;
             moneyModeActive = true;
 
-            float liters = enteredKwacha / PRICE_PER_LITER;
+            float priceForCalc = (dashboardPrice > 0.0f) ? dashboardPrice : PRICE_PER_LITER;
+            float liters = enteredKwacha / priceForCalc;
 
             // safety liters range
             if (liters < MIN_LITERS || liters > MAX_LITERS) {
@@ -1041,7 +1333,7 @@ static void handleSerial() {
   const char cmd = Serial.read();
   switch (cmd) {
     case 'h': case 'H':
-      Serial.println("Commands: s=status, r=reset, d=defaults, t=sales report");
+      Serial.println("Commands: s=status, r=reset, d=defaults, t=sales, w=wifi");
       break;
 
     case 's': case 'S':
@@ -1059,6 +1351,14 @@ static void handleSerial() {
       Serial.printf("Transactions: %u\n", transactionCount);
       Serial.printf("Total Sold: %.2f L\n", salesTotal_L);
       Serial.printf("Total Revenue: K%.2f\n", salesTotal_K);
+      Serial.printf("--- DASHBOARD ---\n");
+      Serial.printf("WiFi: %s (RSSI: %d)\n", wifiConnected ? "ONLINE" : "OFFLINE",
+                    wifiConnected ? WiFi.RSSI() : -127);
+      Serial.printf("Dashboard: %s\n", API_BASE_URL);
+      Serial.printf("Device: %s\n", DEVICE_ID);
+      if (dashboardPrice > 0.0f) {
+        Serial.printf("Dashboard Price: %.2f/L\n", dashboardPrice);
+      }
       Serial.println("==============\n");
       break;
 
@@ -1084,6 +1384,19 @@ static void handleSerial() {
                       salesTotal_L / transactionCount, salesTotal_K / transactionCount);
       }
       Serial.println("====================\n");
+      break;
+
+    case 'w': case 'W':
+      Serial.printf("[WIFI] Status: %s\n", wifiConnected ? "CONNECTED" : "DISCONNECTED");
+      if (wifiConnected) {
+        Serial.printf("[WIFI] IP: %s  RSSI: %d\n",
+                      WiFi.localIP().toString().c_str(), WiFi.RSSI());
+        Serial.printf("[DASHBOARD] %s\n", API_BASE_URL);
+        Serial.printf("[DEVICE] %s\n", DEVICE_ID);
+      } else {
+        Serial.println("[WIFI] Reconnecting...");
+        connectWiFi();
+      }
       break;
   }
 }
@@ -1126,22 +1439,45 @@ void setup() {
 
   lcd.clear();
   lcdPrintPadded(0, 0, "OIL DISPENSER");
-  lcdPrintPadded(0, 1, "PPL=" + String((int)roundf(pulsesPerLiter)));
+  lcdPrintPadded(0, 1, "Connecting WiFi");
 
-  Serial.println("\n==========================================");
-  Serial.println("ESP32 OIL DISPENSER — PIN + SALES EDITION");
-  Serial.println("==========================================");
+  Serial.println("\n=============================================");
+  Serial.println("ESP32 OIL DISPENSER — DASHBOARD CONNECTED");
+  Serial.println("=============================================");
+  Serial.printf("Device: %s  Site: %s\n", DEVICE_ID, SITE_NAME);
+  Serial.printf("Dashboard: %s\n", API_BASE_URL);
   Serial.printf("FLOW_PIN=%u EDGE=%s\n", FLOW_PIN, (FLOW_EDGE == FALLING) ? "FALLING" : "RISING");
   Serial.printf("PPL=%.1f (NVS)\n", pulsesPerLiter);
   Serial.printf("StopLag=%lu ms, StopExtra=%u pulses\n", (unsigned long)stopLagMs, stopExtraPulses);
-  Serial.printf("NoFlowTimeout=%lu ms, OverDispenseLimit=%.0fmL\n",
-                (unsigned long)NO_FLOW_TIMEOUT_MS, OVER_DISPENSE_LIMIT_L * 1000.0f);
   Serial.printf("Sales: %u TX, %.2fL, K%.2f\n", transactionCount, salesTotal_L, salesTotal_K);
+
+  // Connect WiFi
+  connectWiFi();
+
+  // Setup HTTPS client — skip cert validation for Vercel compatibility
+  secureClient.setInsecure();
+
+  // Fetch config (pricing) from dashboard on boot
+  if (wifiConnected) {
+    fetchDeviceConfig();
+    lastConfigFetchMs = millis();
+    sendHeartbeat();
+    lastHeartbeatMs = millis();
+  }
+
   Serial.println("PIN protection ENABLED. Press A to login.");
   Serial.println("Hold * for 3s to enter CAL menu (after login).");
-  Serial.println("==========================================\n");
+  Serial.printf("WiFi: %s | Dashboard: %s\n",
+                wifiConnected ? "ONLINE" : "OFFLINE",
+                wifiConnected ? "CONNECTED" : "will sync when available");
+  Serial.println("=============================================\n");
 
+  // Show WiFi status briefly
+  lcd.clear();
+  lcdPrintPadded(0, 0, "OIL DISPENSER");
+  lcdPrintPadded(0, 1, wifiConnected ? "WiFi: ONLINE" : "WiFi: OFFLINE");
   delay(1200);
+
   resetDispense();
   showLocked();
   state = STATE_LOCKED;
@@ -1152,4 +1488,5 @@ void loop() {
   handleKeypad();
   handleSerial();
   updateDisplay();
+  handleDashboard();  // WiFi + telemetry + heartbeat + config sync
 }
